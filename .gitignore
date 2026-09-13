@@ -1,0 +1,3 @@
+.autonome-venv/
+__pycache__/
+*.db
