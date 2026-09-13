@@ -1,0 +1,31 @@
+services:
+  autonome-worker:
+    build:
+      context: ..
+      dockerfile: autonome/Dockerfile
+    container_name: autonome_worker
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # If using Docker Desktop, host.docker.internal resolves to the host machine
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+    restart: unless-stopped
+
+  autonome-orchestrator:
+    build:
+      context: ..
+      dockerfile: autonome/Dockerfile
+    container_name: autonome_orchestrator
+    command: ["uvicorn", "orchestrator.engine:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
+      - WORKER_URL=http://autonome-worker:8000
+    depends_on:
+      - autonome-worker
+    restart: unless-stopped
