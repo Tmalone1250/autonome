@@ -49,6 +49,30 @@ NODE_ENDPOINT = f"{WORKER_URL}/task"
 # Simulated Sub-Agent Address
 SUB_AGENT_ADDRESS = "0x0000000000000000000000000000000000000001"
 
+def get_operator_vault() -> str:
+    """
+    Fetches the operator's real vault address from the live worker node.
+    The worker holds this in-memory after the desktop app calls /set_vault.
+    Falls back to OPERATOR_VAULT env var, then a zero address.
+    """
+    try:
+        res = requests.get(f"{WORKER_URL}/status", timeout=5)
+        if res.status_code == 200:
+            vault = res.json().get("operator_vault_debug", "")
+            if vault and vault.startswith("0x") and len(vault) == 42:
+                print(f"[BDEXScreener] Resolved operator vault from worker: {vault}")
+                return vault
+    except Exception as e:
+        print(f"[BDEXScreener] Warning: Could not fetch vault from worker: {e}")
+    
+    env_vault = os.environ.get("OPERATOR_VAULT", "")
+    if env_vault and env_vault.startswith("0x"):
+        print(f"[BDEXScreener] Using OPERATOR_VAULT env var: {env_vault}")
+        return env_vault
+    
+    print("[BDEXScreener] CRITICAL: No valid operator vault found. Task will be aborted.")
+    return ""
+
 def get_onchain_quote(amount_in_wbot: float) -> float:
     """
     Fetches the expected USDT output for a given amount of WBOT using BDEX QuoterV2 on Mainnet.
@@ -102,19 +126,19 @@ def run_agent(task_id: str, parameters: dict, prompt_intent: str) -> dict:
         f"Analyze based on this live rate."
     )
     
-    # 3. Dispatch to Compute Node
-    print("\n--- [TESTNET SIMULATION] Auto-Escrowing Task ---")
-    import subprocess
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    deposit_script = os.path.join(script_dir, "..", "deposit_task.py")
-    subprocess.run(["python3", deposit_script, task_id], check=True)
-    print("------------------------------------------------\n")
-    
+    # 3. Resolve the real operator vault before dispatching
+    operator_vault = get_operator_vault()
+    if not operator_vault:
+        return {"error": "Aborting: operator vault address could not be resolved. Start the node first."}
+
+    # 4. Dispatch to Compute Node
     payload = {
         "task_id": task_id,
-        "sub_agent_address": SUB_AGENT_ADDRESS,
-        "prompt": enriched_prompt,
-        "domain": "Web3 & DeFi"
+        "domain": "Web3 & DeFi",
+        "image": "alpine",
+        "env_vars": {"PROMPT": enriched_prompt},
+        "operator_vault": operator_vault,
+        "sub_agent": SUB_AGENT_ADDRESS
     }
     
     print(f"Dispatching task to DePIN node at {NODE_ENDPOINT} ...")

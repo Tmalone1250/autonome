@@ -2,13 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install botchain-sdk-py
+COPY botchain-sdk-py/ /app/botchain-sdk-py/
+
 # We expect the build context to be the BOTCHAIN root directory
 # so we can copy both the SDK and the autonome folder.
 COPY autonome/requirements.txt /app/autonome/
 RUN pip install --no-cache-dir -r /app/autonome/requirements.txt
-
-# Install botchain-sdk-py
-COPY botchain-sdk-py/ /app/botchain-sdk-py/
 RUN pip install /app/botchain-sdk-py/
 
 # Copy worker application

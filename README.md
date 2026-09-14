@@ -1,67 +1,180 @@
-# Autonome: DePIN AI Compute Node Ecosystem
+# Autonome Core Engine & DePIN Worker Node (`autonome/`)
 
-**Autonome** is the DePIN (Decentralized Physical Infrastructure Network) AI worker node ecosystem built on the **BOT Chain** network. The platform connects decentralized hardware providers (Compute Nodes) with AI Sub-Agents, enabling fully verifiable, zero-gas LLM executions backed by smart contract settlements.
-
----
-
-## 🏗️ Architecture Overview
-
-Autonome consists of a deeply integrated three-tier architecture:
-
-### 1. `autonome/` (Compute Node Backend)
-The compute node layer runs on the local hardware of the DePIN worker (e.g., consumer laptops, rigs).
-- **FastAPI Router (`worker.py`)**: Ingests tasks from the network orchestrator, communicates directly with local AI models (such as `Llama-3` running on Ollama via REST), and generates cryptographic execution proofs.
-- **On-Chain Settlement (`settlement.py`)**: Interacts with the BOT Chain network to securely submit proofs on-chain. It builds the zero-gas payload and leverages an Automated Liquidity Manager (ALM) to automatically swap earned tokens for USDT on BDEX V3.
-- **Hardware Isolation**: Executed entirely within a Docker container to ensure security while maintaining local host gateway access (`http://host.docker.internal:11434`) for accelerated local AI inference.
-
-### 2. `autonome-contracts/` (Smart Contract Settlement Layer)
-The on-chain truth and DePIN reward systems are built on standard EVM (Shanghai) Solidity contracts deployed on the BOT Chain (Mainnet: 677, Bohr Testnet: 968).
-- **`AutonomeSettlementEscrow.sol`**: The core settlement contract. It verifies cryptographic execution proofs from worker nodes and processes the release of ATMA rewards to the Compute Node, the Sub-Agent Developer, and the Protocol Treasury. The entry point is `settleTask(bytes32 taskId, address subAgent, address computeNode)`.
-- **`AutonomeToken.sol` (ATMA)**: The native utility and reward token of the Autonome ecosystem used to incentivize hardware providers.
-
-### 3. `botchain-sdk-py/` (Middleware & Automation)
-The official Python SDK bridging the Compute Node to the BOT Chain network, featuring:
-- **Zero-Gas Paymaster Middleware (`MegaFuel`)**: Intercepts transactions and rewrites `gasPrice` to 0. It queries the `pm_isSponsorable` JSON-RPC endpoint to let the protocol treasury subsidize gas costs, abstracting away the need for node operators to hold gas tokens.
-- **Agent Policy & Executor**: Standardized Model Context Protocol (MCP) tooling and trade policies to govern on-chain AI agent behaviors and swaps.
-- **BDEX V3 & ALM Integration**: Provides deterministic tick math and optimal rebalancing routing to interact with BOT Chain's concentrated liquidity DEX (BDEX V3).
+The **Autonome Core Engine & DePIN Worker Node** is the backend execution engine of the BOT Chain Autonomous DePIN Compute Network. It provides agent orchestration, local LLM inference via Ollama, Docker container sandboxing, cryptographic proof signing, and automated web3 settlement dispatching.
 
 ---
 
-## 🚀 The Build & Workflow
+## Architecture Overview
 
-Once a node operator joins the network, the complete autonomous workflow operates as follows:
+The `autonome` module comprises two primary runtime components:
 
-1. **Task Ingestion**: The orchestrator assigns a prompt to the node via `POST /task`.
-2. **Local Inference**: `worker.py` pings the local Ollama instance (running entirely off-chain on local CPU/GPU hardware).
-3. **Cryptographic Proofing**: The node hashes the `task_id`, `prompt`, and `inference_result`, then signs the payload with the node's private EOA key.
-4. **Zero-Gas Settlement**: `settlement.py` uses the `botchain-sdk-py` client to construct the `settleTask` transaction. The SDK's middleware intercepts it, approves sponsorship, and pushes it to the chain without consuming the node's native BOT tokens.
-5. **Reward Distribution**: `AutonomeSettlementEscrow` receives the proof, updates the state, and mints/transfers ATMA tokens to the node operator.
-6. **Automated Liquidity (ALM)**: (Optional) The node triggers an optimal rebalance sequence via `ALMManager`, pulling the earned ATMA and converting a portion to USDT directly on BDEX V3.
+1. **Intent Orchestrator (`orchestrator/engine.py`)**: Runs on **Port 8002**. Receives natural language prompts from the frontend, extracts parameters via Llama 3/Ollama, invokes specialized sub-agents, dispatches compute jobs to active worker nodes, and executes smart contract settlement on BOT Chain (Bohr Testnet).
+2. **DePIN Compute Worker Node (`worker.py`)**: Runs on **Port 8000**. Operates as a lightweight FastAPI daemon (or standalone PyInstaller binary inside the Tauri Desktop App). It accepts compute tasks, executes isolated Docker containers, logs execution telemetry to an internal SQLite database, signs execution proofs with an auto-generated ephemeral EOA key, and exposes status endpoints.
+
+```
+       [ Consumer Frontend / App ]
+                    │
+                    ▼  (Port 8002)
+         ┌─────────────────────┐
+         │ Intent Orchestrator │ ──(Llama 3 Param Extraction)
+         └──────────┬──────────┘
+                    │
+                    ▼  (Port 8000)
+       ┌─────────────────────────┐
+       │   DePIN Worker Node     │
+       │ ┌─────────────────────┐ │
+       │ │   Docker Sandbox    │ │
+       │ └─────────────────────┘ │
+       │  (Ephemeral Key Sign)   │
+       └────────────┬────────────┘
+                    │
+                    ▼
+    ┌──────────────────────────────┐
+    │ AutonomeSettlementEscrow.sol │ ──(70/15/15 Token Split)
+    └──────────────────────────────┘
+```
 
 ---
 
-## 🛠️ Getting Started
+## Directory Structure
+
+```
+autonome/
+├── agents/
+│   └── bdex_screener.py       # Sub-agent module for DEX token screening & data aggregation
+├── orchestrator/
+│   └── engine.py              # FastAPI Orchestrator (Port 8002) & Web3 Settlement Relayer
+├── docs/                      # Technical specifications & architecture reference docs
+├── worker.py                  # FastAPI Compute Worker Node (Port 8000)
+├── settlement.py              # Web3 Settlement helper routines (Web3.py)
+├── authorize_relayer.py       # Admin script: Register relayer address in Escrow contract
+├── deposit_task.py            # Admin script: Deposit tBOT/ATMA escrow funds for tasks
+├── set_validator.py           # Admin script: Register validator addresses
+├── fund_node.py               # Utility: Transfer gas BOHR to ephemeral worker wallets
+├── build_worker.sh            # PyInstaller packaging script for Tauri desktop sidecar
+├── worker-bin.spec            # PyInstaller specification file
+├── Dockerfile                 # Standalone worker node container image
+├── docker-compose.yml         # Container orchestration manifest
+├── requirements.txt           # Python dependency specifications
+└── .env                       # Environment configuration file
+```
+
+---
+
+## Core Features & Functionality
+
+### 1. Intent Orchestrator (`orchestrator/engine.py`)
+- **Natural Language Parsing**: Translates user prompts into structured execution payloads using local LLM models (e.g., Llama 3 via Ollama).
+- **Sub-Agent Routing**: Dynamically matches prompts with specialized agent handlers (e.g., `bdex_screener.py` for decentralized finance analytics).
+- **Gas-Managed Settlement**: Acts as the centralized protocol relayer. Obtains cryptographic proofs from workers and executes `settleTask(taskId, subAgent, operatorVault)` on `AutonomeSettlementEscrow.sol`.
+- **Proof Relay & Status Syncing**: Post-settlement, asynchronously updates worker execution logs with the resulting on-chain transaction hash (`settlement_tx_hash`).
+
+### 2. DePIN Compute Worker Node (`worker.py`)
+- **Docker Container Isolation**: Pulls and runs isolated micro-containers (e.g., `python:3.10-slim`) to execute task code securely without host filesystem exposure.
+- **Ephemeral Wallet Management**: Generates a local, encrypted Secp256k1 keypair on first boot saved at `~/.autonome/worker_key.json`. Operators never handle private keys manually.
+- **Keccak256 Cryptographic Verification**: Hashes execution logs, stdout/stderr, and output artifacts, producing an Ethereum EIP-191 signature (`proof_hash` + `signature`).
+- **Dynamic Vault Syncing**: Accepts node operator vault address updates via `/set_vault` to ensure reward routing to ERC-4337 smart account vaults.
+- **Local Persistence**: Stores task metadata, proof hashes, execution logs, and transaction links in SQLite (`~/.autonome/worker.db`).
+
+---
+
+## API Reference
+
+### Orchestrator Endpoints (`http://localhost:8002`)
+
+| Endpoint | Method | Description | Payload / Query |
+| :--- | :--- | :--- | :--- |
+| `/prompt` | `POST` | Primary entrypoint for user prompts. Parses intent, delegates to sub-agents, triggers worker, and settles on-chain. | `{"prompt": "string"}` |
+| `/tasks` | `GET` | Retrieves full listing of orchestrator execution logs and settlement records. | N/A |
+| `/health` | `GET` | System health check and model connectivity status. | N/A |
+
+### Worker Node Endpoints (`http://localhost:8000`)
+
+| Endpoint | Method | Description | Payload / Query |
+| :--- | :--- | :--- | :--- |
+| `/execute` | `POST` | Receives and executes code inside a Docker container. Generates signed proof. | `{"task_id": "string", "code": "string", "operator_vault": "0x..."}` |
+| `/logs` | `GET` | Fetches historical execution records and settlement transaction hashes. | N/A |
+| `/logs/{task_id}` | `PATCH` | Updates a specific task's `settlement_tx_hash` post-on-chain execution. | `{"settlement_tx_hash": "0x..."}` |
+| `/set_vault` | `POST` | Updates the active Node Operator ERC-4337 Vault address. | `{"operator_vault": "0x..."}` |
+| `/node_info` | `GET` | Exposes node ephemeral EOA wallet address, vault address, and system metrics. | N/A |
+
+---
+
+## Environment Configuration (`.env`)
+
+Create or update `.env` in `autonome/` with the following variables:
+
+```ini
+# BOT Chain RPC Node
+RPC_URL=https://rpc.bohr.life
+CHAIN_ID=968
+
+# Protocol Contracts (Bohr Testnet)
+ESCROW_CONTRACT_ADDRESS=0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E
+ATMA_TOKEN_ADDRESS=0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840
+
+# Orchestrator Relayer EOA Private Key (Must have BOHR gas)
+RELAYER_PRIVATE_KEY=0x...
+
+# Worker Node Settings
+WORKER_PORT=8000
+ORCHESTRATOR_PORT=8002
+OLLAMA_HOST=http://localhost:11434
+```
+
+---
+
+## Local Setup & Development
 
 ### Prerequisites
-- Docker & Docker Compose
-- [Ollama](https://ollama.ai/) running locally with the `llama3` (or equivalent) model.
-- An EOA Private Key for signing transactions.
+- **Python**: 3.10 or higher
+- **Docker**: Docker Engine / Desktop running locally
+- **Ollama**: Installed and running with `llama3` model pulled (`ollama pull llama3`)
 
-### Running the Worker Node
-1. Boot your local AI instance:
-   ```bash
-   ollama run llama3
-   ```
-2. Build the Docker image from the root directory:
-   ```bash
-   docker build -t autonome-worker -f autonome/Dockerfile .
-   ```
-3. Run the container:
-   ```bash
-   docker run -p 8000:8000 \
-     -e NODE_PRIVATE_KEY="YOUR_PRIVATE_KEY" \
-     --add-host=host.docker.internal:host-gateway \
-     autonome-worker
-   ```
+### Virtual Environment Setup
 
-The node will automatically listen on `http://localhost:8000/task` for incoming DePIN tasks and handle all interactions with the BOT Chain network seamlessly.
+```bash
+# Navigate to autonome directory
+cd autonome
+
+# Create and activate virtual environment
+python3 -m venv .autonome-venv
+source .autonome-venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### Running Components Individually
+
+**1. Start Worker Node (Port 8000):**
+```bash
+python worker.py
+```
+
+**2. Start Intent Orchestrator (Port 8002):**
+```bash
+uvicorn orchestrator.engine:app --host 0.0.0.0 --port 8002 --reload
+```
+
+---
+
+## PyInstaller Desktop Sidecar Packaging
+
+The Tauri Desktop App bundles `worker.py` as a standalone binary executable (`worker-bin`). To compile the binary:
+
+```bash
+chmod +x build_worker.sh
+./build_worker.sh
+```
+
+This generates `dist/worker-bin`, which is automatically copied to `autonome-desktop/binaries/worker-bin-x86_64-unknown-linux-gnu`.
+
+---
+
+## Utility Scripts
+
+- **`authorize_relayer.py`**: Grants the orchestrator relayer address `SETTLER_ROLE` in the `AutonomeSettlementEscrow` contract.
+- **`set_validator.py`**: Adds worker node addresses to the authorized validator whitelist.
+- **`deposit_task.py`**: Escrows tBOT / ATMA rewards into the smart contract for task funding.
+- **`fund_node.py`**: Sends initial BOHR native gas tokens to newly generated worker node ephemeral addresses.

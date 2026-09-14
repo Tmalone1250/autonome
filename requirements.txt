@@ -4,5 +4,7 @@ requests
 pydantic
 python-dotenv
 uv
-botchain-sdk-py
+
 psutil
+docker
+pyinstaller
