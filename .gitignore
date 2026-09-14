@@ -1,6 +1,15 @@
+# Environment Variables (CRITICAL: NEVER COMMIT REAL KEYS)
+.env
+.env.*
+*.env
+!.env.example
+
+# Virtual Environments & Caches
 .autonome-venv/
 __pycache__/
 *.db
+
+# Build Artifacts & Documentation
 build/
 dist/
 docs/
