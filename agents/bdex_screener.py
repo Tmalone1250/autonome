@@ -126,32 +126,41 @@ def run_agent(task_id: str, parameters: dict, prompt_intent: str) -> dict:
         f"Analyze based on this live rate."
     )
     
-    # 3. Resolve the real operator vault before dispatching
+    # 3. Resolve the real operator vault before dispatching (if known locally)
+    # The worker can also supply this during the heartbeat if empty.
     operator_vault = get_operator_vault()
-    if not operator_vault:
-        return {"error": "Aborting: operator vault address could not be resolved. Start the node first."}
 
-    # 4. Dispatch to Compute Node
+    # 4. Enqueue to Orchestrator Pull Queue
     payload = {
         "task_id": task_id,
         "domain": "Web3 & DeFi",
         "image": "alpine",
         "env_vars": {"PROMPT": enriched_prompt},
-        "operator_vault": operator_vault,
+        "operator_vault": operator_vault or "0x0000000000000000000000000000000000000000",
         "sub_agent": SUB_AGENT_ADDRESS
     }
     
-    print(f"Dispatching task to DePIN node at {NODE_ENDPOINT} ...")
+    import time
+    enqueue_url = "http://127.0.0.1:8002/tasks/enqueue"
+    status_url = f"http://127.0.0.1:8002/tasks/status/{task_id}"
+
+    print(f"Enqueuing task {task_id} for Pull Workers ...")
     try:
-        response = requests.post(NODE_ENDPOINT, json=payload, timeout=600)
+        response = requests.post(enqueue_url, json=payload, timeout=5)
+        if response.status_code != 200:
+            return {"error": f"Orchestrator Enqueue Error: {response.text}"}
         
-        if response.status_code == 200:
-            print("\n✅ Task Successfully Executed & Settled!")
-            return response.json()
-        else:
-            return {"error": f"Node Error (Status {response.status_code}): {response.text}"}
+        # 5. Poll for completion
+        print("Waiting for node heartbeat and execution...")
+        while True:
+            status_res = requests.get(status_url, timeout=5).json()
+            if status_res.get("status") == "completed":
+                print("\n✅ Task Successfully Executed & Settled via Pull Model!")
+                return status_res.get("result")
+            time.sleep(3)
+
     except requests.exceptions.RequestException as e:
-        return {"error": f"Failed to connect to DePIN node: {e}"}
+        return {"error": f"Failed to enqueue task: {e}"}
 
 if __name__ == "__main__":
     # Test execution

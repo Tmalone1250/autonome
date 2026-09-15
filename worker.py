@@ -96,23 +96,22 @@ class TaskResponse(BaseModel):
     sub_agent: str
     operator_vault: str
 
-@app.post("/task", response_model=TaskResponse)
-def execute_task(manifest: WorkloadManifest):
+def execute_docker_sandbox(manifest: dict):
     try:
         if not NODE_PRIVATE_KEY:
             raise HTTPException(status_code=500, detail="NODE_PRIVATE_KEY not set in environment.")
         if not docker_client:
             raise HTTPException(status_code=500, detail="Docker client not initialized. Is the socket mounted?")
 
-        actual_vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT") or manifest.operator_vault
-        print(f"[Worker] Executing task {manifest.task_id}")
+        actual_vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT") or manifest.get("operator_vault", "")
+        print(f"[Worker] Executing task {manifest["task_id"]}")
         print(f"[Worker] Operator Vault resolved to: {actual_vault}")
 
         # 1. Ephemeral Docker Execution
         try:
             raw_output = docker_client.containers.run(
-                image=manifest.image,
-                environment=manifest.env_vars,
+                image=manifest["image"],
+                environment=manifest.get("env_vars", {}),
                 mem_limit="2g",
                 detach=False,
                 remove=True
@@ -123,7 +122,7 @@ def execute_task(manifest: WorkloadManifest):
 
         # 2. Cryptographic Proof
         client = BotChain(private_key=NODE_PRIVATE_KEY, is_testnet=True)
-        payload_str = f"{manifest.task_id}:{output_str}"
+        payload_str = f"{manifest["task_id"]}:{output_str}"
         proof_hash = client.w3.keccak(text=payload_str).hex()
         
         message = encode_defunct(text=proof_hash)
@@ -139,9 +138,9 @@ def execute_task(manifest: WorkloadManifest):
                 (task_id, timestamp, domain, proof_hash, tx_hash, reward, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
-                manifest.task_id,
+                manifest["task_id"],
                 int(time.time()),
-                manifest.domain,
+                manifest.get("domain", ""),
                 proof_hash,
                 "",
                 "+1.5 ATMA", 
@@ -152,12 +151,12 @@ def execute_task(manifest: WorkloadManifest):
         except Exception as e:
             print(f"[Worker] Warning: Error persisting logs: {e}")
 
-        return TaskResponse(
-            task_id=manifest.task_id,
+        return dict(
+            task_id=manifest["task_id"],
             inference_result=output_str,
             proof_hash=proof_hash,
             signature=signature,
-            sub_agent=manifest.sub_agent,
+            sub_agent=manifest.get("sub_agent", ""),
             operator_vault=actual_vault
         )
 
@@ -167,6 +166,58 @@ def execute_task(manifest: WorkloadManifest):
         import traceback
         print(f"[Worker] Unhandled exception in execute_task: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Internal worker error: {str(e)}")
+
+
+import asyncio
+import requests
+
+async def poll_for_tasks():
+    orchestrator_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8002")
+    node_address = Web3().eth.account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
+    print(f"[Worker] Started Pull Polling Loop against {orchestrator_url}...")
+    
+    while True:
+        try:
+            vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT", "")
+            resp = requests.get(f"{orchestrator_url}/nodes/heartbeat?vault={vault}&node={node_address}", timeout=5)
+            if resp.status_code == 200:
+                task = resp.json()
+                if task.get("status") != "idle":
+                    print(f"[Worker] Received pulled task: {task.get('task_id')}")
+                    
+                    # 1. Execute Sandbox
+                    result = execute_docker_sandbox(task)
+                    
+                    # 2. Post Proof to Orchestrator to trigger settlement
+                    complete_resp = requests.post(f"{orchestrator_url}/tasks/complete", json=result, timeout=60)
+                    if complete_resp.status_code == 200:
+                        complete_data = complete_resp.json()
+                        tx_hash = complete_data.get("tx_hash", "")
+                        
+                        # 3. Save Settlement Tx to local SQLite log
+                        try:
+                            conn = sqlite3.connect(DB_PATH)
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
+                                        (tx_hash, "Settled", task.get("task_id")))
+                            conn.commit()
+                            conn.close()
+                            print(f"[Worker] Settlement success. Tx Hash updated: {tx_hash}")
+                        except Exception as e:
+                            print(f"[Worker] Failed to update local DB: {e}")
+                    else:
+                        print(f"[Worker] Orchestrator settlement failed: {complete_resp.text}")
+        except requests.exceptions.RequestException:
+            pass # Silent fail if orchestrator offline
+        except Exception as e:
+            print(f"[Worker] Polling loop error: {e}")
+        
+        await asyncio.sleep(3)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(poll_for_tasks())
+
 
 @app.get("/logs")
 def get_logs():
