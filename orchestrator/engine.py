@@ -87,6 +87,17 @@ app.add_middleware(
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
+@app.get("/health")
+@app.get("/")
+def health_check():
+    return {
+        "status": "ok",
+        "service": "Autonome Orchestrator",
+        "port": _ORCHESTRATOR_PORT,
+        "relayer_address": relayer_account.address if relayer_account else None,
+        "ollama_host": OLLAMA_HOST
+    }
+
 class OrchestrateRequest(BaseModel):
     prompt: str
     domain: str
