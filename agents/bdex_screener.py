@@ -150,14 +150,8 @@ def run_agent(task_id: str, parameters: dict, prompt_intent: str) -> dict:
         if response.status_code != 200:
             return {"error": f"Orchestrator Enqueue Error: {response.text}"}
         
-        # 5. Poll for completion
-        print("Waiting for node heartbeat and execution...")
-        while True:
-            status_res = requests.get(status_url, timeout=5).json()
-            if status_res.get("status") == "completed":
-                print("\n✅ Task Successfully Executed & Settled via Pull Model!")
-                return status_res.get("result")
-            time.sleep(3)
+        print("\n✅ Task Successfully Enqueued for Pull Workers!")
+        return {"status": "enqueued", "task_id": task_id}
 
     except requests.exceptions.RequestException as e:
         return {"error": f"Failed to enqueue task: {e}"}
