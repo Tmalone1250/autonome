@@ -24,10 +24,9 @@ def free_port(port: int):
     except Exception as e:
         print(f"[Orchestrator] Port-free check skipped: {e}")
 
-# Ensure port 8001 is free before app initializes
-_ORCHESTRATOR_PORT = int(os.environ.get("ORCHESTRATOR_PORT", "8001"))
+# Ensure port 8002 is free before app initializes
+_ORCHESTRATOR_PORT = int(os.environ.get("ORCHESTRATOR_PORT", "8002"))
 free_port(_ORCHESTRATOR_PORT)
-
 
 # Ensure we can import from autonome/agents
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -41,13 +40,21 @@ if not RELAYER_PRIVATE_KEY:
     print("Warning: RELAYER_PRIVATE_KEY not set in .env")
 
 from web3 import Web3
-from web3.middleware import ExtraDataToPOAMiddleware
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware as poa_middleware
+except ImportError:
+    try:
+        from web3.middleware import geth_poa_middleware as poa_middleware
+    except ImportError:
+        poa_middleware = None
+
 from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 
 # Setup Web3 for Bohr Testnet
 w3 = Web3(Web3.HTTPProvider("https://rpc.bohr.life"))
-w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+if poa_middleware:
+    w3.middleware_onion.inject(poa_middleware, layer=0)
 if RELAYER_PRIVATE_KEY:
     relayer_account = Account.from_key(RELAYER_PRIVATE_KEY)
     w3.eth.default_account = relayer_account.address

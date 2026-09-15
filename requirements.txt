@@ -3,8 +3,8 @@ uvicorn
 requests
 pydantic
 python-dotenv
-uv
-
+web3
+eth-account
 psutil
 docker
 pyinstaller
