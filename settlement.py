@@ -9,9 +9,12 @@ ATMA_TOKEN = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
 
 def load_abi(filename):
     base_dir = os.path.dirname(__file__)
-    path = os.path.join(base_dir, "..", "autonome-contracts", "out", filename, filename.replace(".sol", ".json"))
+    json_name = filename.replace(".sol", ".json")
+    local_abi_path = os.path.join(base_dir, "abis", json_name)
+    out_abi_path = os.path.join(base_dir, "..", "autonome-contracts", "out", filename, json_name)
+    
+    path = local_abi_path if os.path.exists(local_abi_path) else out_abi_path
     if not os.path.exists(path):
-        # Allow testing without deployed contracts by mocking the ABI if not found
         if filename == "AutonomeSettlementEscrow.sol":
             return [{
                 "inputs": [
@@ -26,7 +29,8 @@ def load_abi(filename):
             }]
         raise FileNotFoundError(f"ABI file not found at {path}")
     with open(path, 'r') as f:
-        return json.load(f)["abi"]
+        data = json.load(f)
+        return data["abi"] if "abi" in data else data
 
 def execute_settlement(task_id: str, sub_agent_address: str, private_key: str) -> str:
     # 1. Initialize SDK
