@@ -1,11 +1,12 @@
 import os
 import sys
 import json
+import asyncio
 import secrets
 import signal
 import socket
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -74,9 +75,8 @@ ESCROW_ABI = [{
     "type": "function"
 }]
 
-app = FastAPI(title="Autonome Orchestrator", version="1.0.0")
+app = FastAPI(title="Autonome Orchestrator", version="2.0.0")
 
-# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,10 +87,16 @@ app.add_middleware(
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
+# ---------------------------------------------------------------------------
+# Task State
+# ---------------------------------------------------------------------------
+PENDING_TASKS: dict = {}   # HTTP fallback queue for non-WS workers
+COMPLETED_TASKS: dict = {} # Finalized results keyed by task_id
+ACTIVE_WORKERS: dict = {}  # {node_address: WebSocket} — live connections
 
-PENDING_TASKS = {}
-COMPLETED_TASKS = {}
-
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 class TaskManifest(BaseModel):
     task_id: str
     domain: str
@@ -98,29 +104,6 @@ class TaskManifest(BaseModel):
     env_vars: dict = {}
     operator_vault: str
     sub_agent: str
-
-@app.post("/tasks/enqueue")
-def enqueue_task(manifest: TaskManifest):
-    PENDING_TASKS[manifest.task_id] = manifest.dict()
-    return {"status": "enqueued", "task_id": manifest.task_id}
-
-@app.get("/nodes/heartbeat")
-def node_heartbeat(vault: str = "", node: str = ""):
-    if not PENDING_TASKS:
-        return {"status": "idle"}
-    task_id = next(iter(PENDING_TASKS))
-    task = PENDING_TASKS.pop(task_id)
-    if vault and not task.get("operator_vault"):
-        task["operator_vault"] = vault
-    return task
-
-@app.get("/tasks/status/{task_id}")
-def get_task_status(task_id: str):
-    if task_id in COMPLETED_TASKS:
-        return {"status": "completed", "result": COMPLETED_TASKS[task_id]}
-    if task_id in PENDING_TASKS:
-        return {"status": "pending"}
-    return {"status": "processing"}
 
 class CompleteTaskRequest(BaseModel):
     task_id: str
@@ -130,80 +113,228 @@ class CompleteTaskRequest(BaseModel):
     sub_agent: str
     operator_vault: str
 
-@app.post("/tasks/complete")
-def complete_task(request: CompleteTaskRequest):
-    t_id = request.task_id
-    tx_hash = ""
-    error = ""
-    if relayer_account:
-        print(f"Worker execution completed. Settling on-chain as Relayer...")
-        try:
-            contract = w3.eth.contract(address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI)
-            if t_id.startswith('0x'):
-                task_id_bytes = w3.to_bytes(hexstr=t_id)
-            else:
-                task_id_bytes = w3.keccak(text=t_id)
-            sub_agent_address = w3.to_checksum_address(request.sub_agent)
-            operator_vault = w3.to_checksum_address(request.operator_vault)
-            
-            import subprocess
-            import os
-            deposit_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "deposit_task.py"))
-            subprocess.run(["python3", deposit_script, t_id], check=True)
-
-            tx_dict = contract.functions.settleTask(
-                task_id_bytes,
-                sub_agent_address,
-                operator_vault
-            ).build_transaction({
-                'from': relayer_account.address,
-                'nonce': w3.eth.get_transaction_count(relayer_account.address),
-                'chainId': 968,
-                'gas': 1500000,
-                'gasPrice': w3.eth.gas_price
-            })
-            signed_tx = w3.eth.account.sign_transaction(tx_dict, private_key=RELAYER_PRIVATE_KEY)
-            tx_hash_bytes = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            tx_hash = w3.to_hex(tx_hash_bytes)
-            
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash_bytes, timeout=15)
-            if receipt.status != 1:
-                raise RuntimeError(f"Settlement reverted on-chain: {tx_hash}")
-                
-            print(f"Successfully settled task {t_id} with tx_hash {tx_hash}")
-        except Exception as e:
-            error = f"Relayer settlement failed: {str(e)}"
-            print(error)
-
-    COMPLETED_TASKS[t_id] = {
-        "inference_result": request.inference_result,
-        "proof_hash": request.proof_hash,
-        "settlement_tx_hash": tx_hash,
-        "error": error
-    }
-    return {"status": "completed", "task_id": t_id, "tx_hash": tx_hash}
-
-
-@app.get("/health")
-@app.get("/")
-def health_check():
-    return {
-        "status": "ok",
-        "service": "Autonome Orchestrator",
-        "port": _ORCHESTRATOR_PORT,
-        "relayer_address": relayer_account.address if relayer_account else None,
-        "ollama_host": OLLAMA_HOST
-    }
-
 class OrchestrateRequest(BaseModel):
     prompt: str
     domain: str
     user_address: str
 
+# ---------------------------------------------------------------------------
+# Settlement — runs in a thread executor to avoid blocking the event loop
+# ---------------------------------------------------------------------------
+def _run_settlement_sync(t_id: str, sub_agent: str, operator_vault: str) -> dict:
+    """
+    Blocking Web3 settlement. Must be called via run_in_executor — never directly
+    from async code, as wait_for_transaction_receipt blocks the thread.
+    """
+    tx_hash = ""
+    error = ""
+
+    if not relayer_account:
+        return {"tx_hash": "", "error": "No relayer account configured"}
+
+    # Fire-and-forget deposit (testnet simulation) — Popen does NOT block
+    try:
+        import subprocess
+        deposit_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "deposit_task.py")
+        )
+        subprocess.Popen(
+            ["python3", deposit_script, t_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        print(f"[Orchestrator] Deposit script launched (background) for {t_id}")
+    except Exception as e:
+        print(f"[Orchestrator] Warning: Could not launch deposit script: {e}")
+
+    try:
+        contract = w3.eth.contract(
+            address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI
+        )
+
+        if t_id.startswith("0x"):
+            task_id_bytes = w3.to_bytes(hexstr=t_id)
+        else:
+            task_id_bytes = w3.keccak(text=t_id)
+
+        sub_agent_addr = w3.to_checksum_address(sub_agent)
+        vault_addr = w3.to_checksum_address(operator_vault)
+
+        tx_dict = contract.functions.settleTask(
+            task_id_bytes, sub_agent_addr, vault_addr
+        ).build_transaction({
+            "from": relayer_account.address,
+            "nonce": w3.eth.get_transaction_count(relayer_account.address),
+            "chainId": 968,
+            "gas": 1500000,
+            "gasPrice": w3.eth.gas_price,
+        })
+
+        signed_tx = w3.eth.account.sign_transaction(tx_dict, private_key=RELAYER_PRIVATE_KEY)
+        tx_hash_bytes = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        tx_hash = w3.to_hex(tx_hash_bytes)
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash_bytes, timeout=30)
+        if receipt.status != 1:
+            raise RuntimeError(f"Settlement reverted: {tx_hash}")
+
+        print(f"[Orchestrator] ✅ Settled {t_id} — tx: {tx_hash}")
+
+    except Exception as e:
+        error = f"Relayer settlement failed: {str(e)}"
+        print(f"[Orchestrator] ❌ {error}")
+
+    return {"tx_hash": tx_hash, "error": error}
+
+
+async def _settle_async(t_id: str, sub_agent: str, operator_vault: str) -> dict:
+    """Async wrapper — offloads blocking Web3 call to thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_settlement_sync, t_id, sub_agent, operator_vault)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Endpoint — primary task dispatch path
+# ---------------------------------------------------------------------------
+@app.websocket("/ws/worker")
+async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""):
+    await websocket.accept()
+    ACTIVE_WORKERS[node] = websocket
+    print(f"[Orchestrator] ✅ Worker connected: {node}  vault: {vault}")
+
+    # Drain any tasks queued before this worker came online
+    if PENDING_TASKS:
+        task_id = next(iter(PENDING_TASKS))
+        task = PENDING_TASKS.pop(task_id)
+        if vault and not task.get("operator_vault"):
+            task["operator_vault"] = vault
+        print(f"[Orchestrator] Draining queued task {task_id} → {node}")
+        await websocket.send_json({"type": "task", **task})
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
+            msg_type = data.get("type", "")
+
+            if msg_type == "task_complete":
+                t_id = data.get("task_id", "")
+                print(f"[Orchestrator] task_complete received for {t_id} from {node}")
+
+                # Settle on-chain without blocking the event loop
+                settlement = await _settle_async(
+                    t_id,
+                    data.get("sub_agent", ""),
+                    data.get("operator_vault", "")
+                )
+
+                COMPLETED_TASKS[t_id] = {
+                    "inference_result": data.get("inference_result", ""),
+                    "proof_hash":       data.get("proof_hash", ""),
+                    "settlement_tx_hash": settlement["tx_hash"],
+                    "error":            settlement["error"],
+                }
+
+                # Notify worker so it can update its local SQLite log
+                await websocket.send_json({
+                    "type":    "settlement_complete",
+                    "task_id": t_id,
+                    "tx_hash": settlement["tx_hash"],
+                    "error":   settlement["error"],
+                })
+
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        ACTIVE_WORKERS.pop(node, None)
+        print(f"[Orchestrator] Worker disconnected: {node}")
+    except Exception as e:
+        ACTIVE_WORKERS.pop(node, None)
+        print(f"[Orchestrator] WebSocket error ({node}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Task Queue Endpoints
+# ---------------------------------------------------------------------------
+@app.post("/tasks/enqueue")
+async def enqueue_task(manifest: TaskManifest):
+    task_dict = manifest.dict()
+
+    # Push directly to a live WebSocket worker (sub-50ms dispatch)
+    for node_addr, ws in list(ACTIVE_WORKERS.items()):
+        try:
+            await ws.send_json({"type": "task", **task_dict})
+            print(f"[Orchestrator] ⚡ Pushed {manifest.task_id} via WS → {node_addr}")
+            return {"status": "enqueued", "task_id": manifest.task_id}
+        except Exception:
+            # Stale connection — remove and try next
+            ACTIVE_WORKERS.pop(node_addr, None)
+
+    # Fallback: queue for HTTP heartbeat pickup
+    PENDING_TASKS[manifest.task_id] = task_dict
+    print(f"[Orchestrator] No WS workers online. Task {manifest.task_id} queued for HTTP pickup.")
+    return {"status": "enqueued", "task_id": manifest.task_id}
+
+
+@app.get("/nodes/heartbeat")
+def node_heartbeat(vault: str = "", node: str = ""):
+    """HTTP fallback heartbeat — retained for backward compatibility."""
+    if not PENDING_TASKS:
+        return {"status": "idle"}
+    task_id = next(iter(PENDING_TASKS))
+    task = PENDING_TASKS.pop(task_id)
+    if vault and not task.get("operator_vault"):
+        task["operator_vault"] = vault
+    return task
+
+
+@app.get("/tasks/status/{task_id}")
+def get_task_status(task_id: str):
+    if task_id in COMPLETED_TASKS:
+        return {"status": "completed", "result": COMPLETED_TASKS[task_id]}
+    if task_id in PENDING_TASKS:
+        return {"status": "pending"}
+    return {"status": "processing"}
+
+
+@app.post("/tasks/complete")
+async def complete_task(request: CompleteTaskRequest):
+    """HTTP fallback completion — for workers still using HTTP heartbeat."""
+    t_id = request.task_id
+    settlement = await _settle_async(t_id, request.sub_agent, request.operator_vault)
+
+    COMPLETED_TASKS[t_id] = {
+        "inference_result":   request.inference_result,
+        "proof_hash":         request.proof_hash,
+        "settlement_tx_hash": settlement["tx_hash"],
+        "error":              settlement["error"],
+    }
+    return {"status": "completed", "task_id": t_id, "tx_hash": settlement["tx_hash"]}
+
+
+# ---------------------------------------------------------------------------
+# Health & Orchestration
+# ---------------------------------------------------------------------------
+@app.get("/health")
+@app.get("/")
+def health_check():
+    return {
+        "status":          "ok",
+        "service":         "Autonome Orchestrator",
+        "version":         "2.0.0",
+        "port":            _ORCHESTRATOR_PORT,
+        "relayer_address": relayer_account.address if relayer_account else None,
+        "ollama_host":     OLLAMA_HOST,
+        "active_workers":  len(ACTIVE_WORKERS),
+        "pending_tasks":   len(PENDING_TASKS),
+    }
+
+
 @app.post("/orchestrate")
 def orchestrate(request: OrchestrateRequest):
     print(f"Received Orchestration Request for domain: {request.domain}")
-    # 1. Parse intent using local Ollama (llama3)
+
     system_prompt = """You are the Autonome Orchestrator Brain.
 You receive a raw user intent and must extract the parameters needed for specialized sub-agents.
 Return ONLY a strictly valid JSON object (no markdown, no extra text) with the following schema:
@@ -215,15 +346,14 @@ Return ONLY a strictly valid JSON object (no markdown, no extra text) with the f
   "estimated_credits": number (between 0.5 and 50 depending on complexity)
 }
 """
-    
     payload = {
         "model": "llama3",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Domain: {request.domain}\nPrompt: {request.prompt}"}
+            {"role": "user",   "content": f"Domain: {request.domain}\nPrompt: {request.prompt}"}
         ],
         "stream": False,
-        "format": "json"
+        "format": "json",
     }
 
     try:
@@ -235,20 +365,16 @@ Return ONLY a strictly valid JSON object (no markdown, no extra text) with the f
         raise HTTPException(status_code=500, detail=f"Ollama Parsing Failed: {str(e)}")
 
     task_id = "0x" + secrets.token_hex(32)
-    
-    # 2. Sub-Agent Routing
-    if request.domain == "web3" or request.domain == "Web3 & DeFi":
-        # Route to BDEX Screener
+
+    if request.domain in ("web3", "Web3 & DeFi"):
         print(f"Routing task {task_id} to BDEX Screener Sub-Agent...")
         sub_agent_result = bdex_run_agent(task_id, parsed_intent.get("parameters", {}), request.prompt)
     else:
-        # Fallback or generic routing
         sub_agent_result = {"error": f"No active sub-agent for domain: {request.domain}"}
 
-    # 4. Return full lifecycle result
     return {
-        "status": "success",
-        "task_id": task_id,
-        "parsed_intent": parsed_intent,
-        "sub_agent_result": sub_agent_result
+        "status":           "success",
+        "task_id":          task_id,
+        "parsed_intent":    parsed_intent,
+        "sub_agent_result": sub_agent_result,
     }

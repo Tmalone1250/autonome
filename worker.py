@@ -169,54 +169,104 @@ def execute_docker_sandbox(manifest: dict):
 
 
 import asyncio
+import websockets
 import requests
 
-async def poll_for_tasks():
-    orchestrator_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8002")
-    node_address = Web3().eth.account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
-    print(f"[Worker] Started Pull Polling Loop against {orchestrator_url}...")
-    
-    while True:
+async def execute_and_report(task: dict, ws):
+    """
+    Execute a task in a thread pool (non-blocking) then send the signed
+    proof back to the Orchestrator over the open WebSocket connection.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, execute_docker_sandbox, task)
+        await ws.send(json.dumps({"type": "task_complete", **result}))
+        print(f"[Worker] ✅ Proof submitted for task {task.get('task_id')}")
+    except Exception as e:
+        print(f"[Worker] execute_and_report error: {e}")
+        # Send an error proof so the Orchestrator doesn't hang
         try:
-            vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT", "")
-            resp = requests.get(f"{orchestrator_url}/nodes/heartbeat?vault={vault}&node={node_address}", timeout=5)
-            if resp.status_code == 200:
-                task = resp.json()
-                if task.get("status") != "idle":
-                    print(f"[Worker] Received pulled task: {task.get('task_id')}")
-                    
-                    # 1. Execute Sandbox
-                    result = execute_docker_sandbox(task)
-                    
-                    # 2. Post Proof to Orchestrator to trigger settlement
-                    complete_resp = requests.post(f"{orchestrator_url}/tasks/complete", json=result, timeout=60)
-                    if complete_resp.status_code == 200:
-                        complete_data = complete_resp.json()
-                        tx_hash = complete_data.get("tx_hash", "")
-                        
-                        # 3. Save Settlement Tx to local SQLite log
+            await ws.send(json.dumps({
+                "type":             "task_complete",
+                "task_id":          task.get("task_id", ""),
+                "inference_result": f"Error: {str(e)}",
+                "proof_hash":       "",
+                "signature":        "",
+                "sub_agent":        task.get("sub_agent", ""),
+                "operator_vault":   task.get("operator_vault", ""),
+            }))
+        except Exception:
+            pass
+
+
+async def connect_to_orchestrator():
+    """
+    Persistent outbound WebSocket connection to the Orchestrator.
+    Initiated from the worker so NAT/firewalls are never an issue.
+    Uses exponential backoff (1s → 60s) on disconnect.
+    """
+    orchestrator_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8002")
+    ws_url = orchestrator_url.replace("http://", "ws://").replace("https://", "wss://")
+    node_address = Web3().eth.account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
+
+    backoff = 1
+    while True:
+        vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT", "")
+        full_url = f"{ws_url}/ws/worker?vault={vault}&node={node_address}"
+        print(f"[Worker] Connecting to Orchestrator WebSocket: {full_url}")
+        try:
+            async with websockets.connect(
+                full_url,
+                ping_interval=20,
+                ping_timeout=10,
+                open_timeout=10,
+            ) as ws:
+                backoff = 1  # Reset backoff on successful connection
+                print(f"[Worker] ✅ WebSocket connected. Awaiting tasks...")
+
+                async for raw_message in ws:
+                    data = json.loads(raw_message)
+                    msg_type = data.get("type", "")
+
+                    if msg_type == "task":
+                        print(f"[Worker] ⚡ Task received via WebSocket: {data.get('task_id')}")
+                        # Run in background — keeps WS loop responsive for next task
+                        asyncio.create_task(execute_and_report(data, ws))
+
+                    elif msg_type == "settlement_complete":
+                        # Orchestrator settled on-chain — write tx_hash to local SQLite
+                        t_id    = data.get("task_id", "")
+                        tx_hash = data.get("tx_hash", "")
                         try:
                             conn = sqlite3.connect(DB_PATH)
                             cursor = conn.cursor()
-                            cursor.execute("UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
-                                        (tx_hash, "Settled", task.get("task_id")))
+                            cursor.execute(
+                                "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
+                                (tx_hash, "Settled", t_id),
+                            )
                             conn.commit()
                             conn.close()
-                            print(f"[Worker] Settlement success. Tx Hash updated: {tx_hash}")
+                            print(f"[Worker] Settlement logged — tx: {tx_hash}")
                         except Exception as e:
                             print(f"[Worker] Failed to update local DB: {e}")
-                    else:
-                        print(f"[Worker] Orchestrator settlement failed: {complete_resp.text}")
-        except requests.exceptions.RequestException:
-            pass # Silent fail if orchestrator offline
+
+                    elif msg_type == "pong":
+                        pass  # keepalive response — no action needed
+
+        except (websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.InvalidURI,
+                OSError) as e:
+            print(f"[Worker] WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
         except Exception as e:
-            print(f"[Worker] Polling loop error: {e}")
-        
-        await asyncio.sleep(3)
+            print(f"[Worker] Unexpected error: {e}. Reconnecting in {backoff}s...")
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)  # Exponential backoff, cap at 60s
+
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(poll_for_tasks())
+    asyncio.create_task(connect_to_orchestrator())
 
 
 @app.get("/logs")

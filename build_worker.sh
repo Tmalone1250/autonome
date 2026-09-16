@@ -12,6 +12,9 @@ echo "Compiling worker.py to a standalone executable..."
 pyinstaller --onefile \
     --hidden-import web3 \
     --hidden-import eth_account \
+    --hidden-import websockets \
+    --hidden-import websockets.legacy \
+    --hidden-import websockets.legacy.client \
     --copy-metadata py_ecc \
     --collect-all eth_account \
     --collect-all eth_utils \
