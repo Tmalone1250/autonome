@@ -240,34 +240,34 @@ async def connect_to_orchestrator():
                         data = json.loads(raw_message)
                         msg_type = data.get("type", "")
 
-                    if msg_type == "task":
-                        print(f"[Worker] ⚡ Task received via WebSocket: {data.get('task_id')}")
-                        # Run in background — keeps WS loop responsive for next task
-                        asyncio.create_task(execute_and_report(data, ws))
+                        if msg_type == "task":
+                            print(f"[Worker] ⚡ Task received via WebSocket: {data.get('task_id')}")
+                            # Run in background — keeps WS loop responsive for next task
+                            asyncio.create_task(execute_and_report(data, ws))
 
-                    elif msg_type == "settlement_complete":
-                        # Orchestrator settled on-chain — write tx_hash to local SQLite
-                        t_id    = data.get("task_id", "")
-                        tx_hash = data.get("tx_hash", "")
-                        error   = data.get("error", "")
-                        
-                        final_status = "Settled" if not error else "Failed"
-                        
-                        try:
-                            conn = sqlite3.connect(DB_PATH)
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
-                                (tx_hash, final_status, t_id),
-                            )
-                            conn.commit()
-                            conn.close()
-                            print(f"[Worker] Settlement logged — tx: {tx_hash} | status: {final_status}")
-                        except Exception as e:
-                            print(f"[Worker] Failed to update local DB: {e}")
+                        elif msg_type == "settlement_complete":
+                            # Orchestrator settled on-chain — write tx_hash to local SQLite
+                            t_id    = data.get("task_id", "")
+                            tx_hash = data.get("tx_hash", "")
+                            error   = data.get("error", "")
+                            
+                            final_status = "Settled" if not error else "Failed"
+                            
+                            try:
+                                conn = sqlite3.connect(DB_PATH)
+                                cursor = conn.cursor()
+                                cursor.execute(
+                                    "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
+                                    (tx_hash, final_status, t_id),
+                                )
+                                conn.commit()
+                                conn.close()
+                                print(f"[Worker] Settlement logged — tx: {tx_hash} | status: {final_status}")
+                            except Exception as e:
+                                print(f"[Worker] Failed to update local DB: {e}")
 
-                    elif msg_type == "pong":
-                        pass  # keepalive response — no action needed
+                        elif msg_type == "pong":
+                            pass  # keepalive response — no action needed
                 finally:
                     heartbeat_task.cancel()
 

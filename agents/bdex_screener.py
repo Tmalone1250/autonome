@@ -51,26 +51,14 @@ SUB_AGENT_ADDRESS = "0x0000000000000000000000000000000000000001"
 
 def get_operator_vault() -> str:
     """
-    Fetches the operator's real vault address from the live worker node.
-    The worker holds this in-memory after the desktop app calls /set_vault.
-    Falls back to OPERATOR_VAULT env var, then a zero address.
+    Fetches the operator vault from the environment.
+    (The Orchestrator's engine.py will dynamically override this with the actual
+    connected worker's vault at enqueue time).
     """
-    try:
-        res = requests.get(f"{WORKER_URL}/status", timeout=5)
-        if res.status_code == 200:
-            vault = res.json().get("operator_vault_debug", "")
-            if vault and vault.startswith("0x") and len(vault) == 42:
-                print(f"[BDEXScreener] Resolved operator vault from worker: {vault}")
-                return vault
-    except Exception as e:
-        print(f"[BDEXScreener] Warning: Could not fetch vault from worker: {e}")
-    
     env_vault = os.environ.get("OPERATOR_VAULT", "")
     if env_vault and env_vault.startswith("0x"):
-        print(f"[BDEXScreener] Using OPERATOR_VAULT env var: {env_vault}")
         return env_vault
     
-    print("[BDEXScreener] CRITICAL: No valid operator vault found. Task will be aborted.")
     return ""
 
 def get_onchain_quote(amount_in_wbot: float) -> float:
