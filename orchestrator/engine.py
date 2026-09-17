@@ -93,6 +93,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 PENDING_TASKS: dict = {}   # HTTP fallback queue for non-WS workers
 COMPLETED_TASKS: dict = {} # Finalized results keyed by task_id
 ACTIVE_WORKERS: dict = {}  # {node_address: WebSocket} — live connections
+PENDING_DEPOSITS: dict = {} # {task_id: asyncio.Task} — tracks active deposit processes
 
 # ---------------------------------------------------------------------------
 # Models
@@ -131,21 +132,6 @@ def _run_settlement_sync(t_id: str, sub_agent: str, operator_vault: str) -> dict
 
     if not relayer_account:
         return {"tx_hash": "", "error": "No relayer account configured"}
-
-    # Fire-and-forget deposit (testnet simulation) — Popen does NOT block
-    try:
-        import subprocess
-        deposit_script = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "deposit_task.py")
-        )
-        subprocess.Popen(
-            ["python3", deposit_script, t_id],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        print(f"[Orchestrator] Deposit script launched (background) for {t_id}")
-    except Exception as e:
-        print(f"[Orchestrator] Warning: Could not launch deposit script: {e}")
 
     try:
         contract = w3.eth.contract(
@@ -221,6 +207,12 @@ async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""
                 t_id = data.get("task_id", "")
                 print(f"[Orchestrator] task_complete received for {t_id} from {node}")
 
+                # Wait for the background deposit to finish mining (if it hasn't already)
+                deposit_task = PENDING_DEPOSITS.pop(t_id, None)
+                if deposit_task:
+                    print(f"[Orchestrator] Awaiting deposit confirmation for {t_id} before settling...")
+                    await deposit_task
+
                 # Settle on-chain without blocking the event loop
                 settlement = await _settle_async(
                     t_id,
@@ -257,9 +249,31 @@ async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""
 # ---------------------------------------------------------------------------
 # Task Queue Endpoints
 # ---------------------------------------------------------------------------
+async def run_deposit_async(task_id: str):
+    try:
+        deposit_script = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "deposit_task.py")
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "python3", deposit_script, task_id,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            print(f"[Orchestrator] ❌ Deposit failed for {task_id}: {stderr.decode()}")
+        else:
+            print(f"[Orchestrator] 💰 Deposit confirmed for {task_id}")
+    except Exception as e:
+        print(f"[Orchestrator] ❌ Deposit script exception for {task_id}: {e}")
+
 @app.post("/tasks/enqueue")
 async def enqueue_task(manifest: TaskManifest):
     task_dict = manifest.dict()
+
+    # Launch deposit script asynchronously and track the task
+    PENDING_DEPOSITS[manifest.task_id] = asyncio.create_task(run_deposit_async(manifest.task_id))
+    print(f"[Orchestrator] 💰 True Pipelining: Deposit task started for {manifest.task_id}")
 
     # Push directly to a live WebSocket worker (sub-50ms dispatch)
     for node_addr, ws in list(ACTIVE_WORKERS.items()):
@@ -302,6 +316,13 @@ def get_task_status(task_id: str):
 async def complete_task(request: CompleteTaskRequest):
     """HTTP fallback completion — for workers still using HTTP heartbeat."""
     t_id = request.task_id
+
+    # Wait for the background deposit to finish mining (if it hasn't already)
+    deposit_task = PENDING_DEPOSITS.pop(t_id, None)
+    if deposit_task:
+        print(f"[Orchestrator] Awaiting deposit confirmation for {t_id} before settling...")
+        await deposit_task
+
     settlement = await _settle_async(t_id, request.sub_agent, request.operator_vault)
 
     COMPLETED_TASKS[t_id] = {
