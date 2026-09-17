@@ -92,8 +92,10 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # ---------------------------------------------------------------------------
 PENDING_TASKS: dict = {}   # HTTP fallback queue for non-WS workers
 COMPLETED_TASKS: dict = {} # Finalized results keyed by task_id
-ACTIVE_WORKERS: dict = {}  # {node_address: WebSocket} — live connections
+ACTIVE_WORKERS: dict = {}  # {node_address: {"ws": WebSocket, "vault": str}} — live connections
 PENDING_DEPOSITS: dict = {} # {task_id: asyncio.Task} — tracks active deposit processes
+
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # ---------------------------------------------------------------------------
 # Models
@@ -185,7 +187,8 @@ async def _settle_async(t_id: str, sub_agent: str, operator_vault: str) -> dict:
 @app.websocket("/ws/worker")
 async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""):
     await websocket.accept()
-    ACTIVE_WORKERS[node] = websocket
+    # Store both the WS connection and the vault address supplied at connect time
+    ACTIVE_WORKERS[node] = {"ws": websocket, "vault": vault}
     print(f"[Orchestrator] ✅ Worker connected: {node}  vault: {vault}")
 
     # Drain any tasks queued before this worker came online
@@ -246,6 +249,20 @@ async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""
         print(f"[Orchestrator] WebSocket error ({node}): {e}")
 
 
+def _resolve_vault(manifest_vault: str) -> str:
+    """
+    Return the best available vault address.
+    Prefer the vault registered by a live WebSocket worker over whatever
+    bdex_screener.py injected (which may be the zero address when the VPS
+    cannot reach the worker's /status endpoint at 127.0.0.1:8000).
+    """
+    for entry in ACTIVE_WORKERS.values():
+        v = entry.get("vault", "")
+        if v and v.startswith("0x") and len(v) == 42 and v != ZERO_ADDRESS:
+            return v
+    return manifest_vault
+
+
 # ---------------------------------------------------------------------------
 # Task Queue Endpoints
 # ---------------------------------------------------------------------------
@@ -271,12 +288,18 @@ async def run_deposit_async(task_id: str):
 async def enqueue_task(manifest: TaskManifest):
     task_dict = manifest.dict()
 
+    # Inject the correct vault — overrides zero-address fallback from bdex_screener
+    resolved_vault = _resolve_vault(task_dict.get("operator_vault", ""))
+    task_dict["operator_vault"] = resolved_vault
+    print(f"[Orchestrator] 🔑 Vault resolved: {resolved_vault}")
+
     # Launch deposit script asynchronously and track the task
     PENDING_DEPOSITS[manifest.task_id] = asyncio.create_task(run_deposit_async(manifest.task_id))
     print(f"[Orchestrator] 💰 True Pipelining: Deposit task started for {manifest.task_id}")
 
     # Push directly to a live WebSocket worker (sub-50ms dispatch)
-    for node_addr, ws in list(ACTIVE_WORKERS.items()):
+    for node_addr, entry in list(ACTIVE_WORKERS.items()):
+        ws = entry["ws"]
         try:
             await ws.send_json({"type": "task", **task_dict})
             print(f"[Orchestrator] ⚡ Pushed {manifest.task_id} via WS → {node_addr}")
