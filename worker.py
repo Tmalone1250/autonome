@@ -223,10 +223,22 @@ async def connect_to_orchestrator():
             ) as ws:
                 backoff = 1  # Reset backoff on successful connection
                 print(f"[Worker] ✅ WebSocket connected. Awaiting tasks...")
+                
+                async def send_heartbeat():
+                    while True:
+                        try:
+                            await asyncio.sleep(5)
+                            hw = get_node_status().get("hardware", {})
+                            await ws.send(json.dumps({"type": "ping", "hardware": hw}))
+                        except Exception:
+                            break
 
-                async for raw_message in ws:
-                    data = json.loads(raw_message)
-                    msg_type = data.get("type", "")
+                heartbeat_task = asyncio.create_task(send_heartbeat())
+
+                try:
+                    async for raw_message in ws:
+                        data = json.loads(raw_message)
+                        msg_type = data.get("type", "")
 
                     if msg_type == "task":
                         print(f"[Worker] ⚡ Task received via WebSocket: {data.get('task_id')}")
@@ -256,6 +268,8 @@ async def connect_to_orchestrator():
 
                     elif msg_type == "pong":
                         pass  # keepalive response — no action needed
+                finally:
+                    heartbeat_task.cancel()
 
         except (websockets.exceptions.ConnectionClosed,
                 websockets.exceptions.InvalidURI,

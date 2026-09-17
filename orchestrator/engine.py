@@ -92,8 +92,17 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 # ---------------------------------------------------------------------------
 PENDING_TASKS: dict = {}   # HTTP fallback queue for non-WS workers
 COMPLETED_TASKS: dict = {} # Finalized results keyed by task_id
-ACTIVE_WORKERS: dict = {}  # {node_address: {"ws": WebSocket, "vault": str}} — live connections
+ACTIVE_WORKERS: dict = {}  # {node_address: {"ws": WebSocket, "vault": str, "last_heartbeat": float, "hardware": dict}} — live connections
 PENDING_DEPOSITS: dict = {} # {task_id: asyncio.Task} — tracks active deposit processes
+
+# Admin Telemetry State
+DROPPED_TASKS_COUNT = 0
+DOMAIN_STATS = {
+    "Web3": 0,
+    "Code": 0,
+    "Media": 0,
+    "Utility": 0
+}
 
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -186,9 +195,15 @@ async def _settle_async(t_id: str, sub_agent: str, operator_vault: str) -> dict:
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/worker")
 async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""):
+    import time
     await websocket.accept()
     # Store both the WS connection and the vault address supplied at connect time
-    ACTIVE_WORKERS[node] = {"ws": websocket, "vault": vault}
+    ACTIVE_WORKERS[node] = {
+        "ws": websocket, 
+        "vault": vault,
+        "last_heartbeat": time.time(),
+        "hardware": {"cpu": "Unknown", "ram": "Unknown"}
+    }
     print(f"[Orchestrator] ✅ Worker connected: {node}  vault: {vault}")
 
     # Drain any tasks queued before this worker came online
@@ -239,6 +254,11 @@ async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""
                 })
 
             elif msg_type == "ping":
+                import time
+                ACTIVE_WORKERS[node]["last_heartbeat"] = time.time()
+                hardware = data.get("hardware", {})
+                if hardware:
+                    ACTIVE_WORKERS[node]["hardware"] = hardware
                 await websocket.send_json({"type": "pong"})
 
     except WebSocketDisconnect:
@@ -307,6 +327,9 @@ async def enqueue_task(manifest: TaskManifest):
         except Exception:
             # Stale connection — remove and try next
             ACTIVE_WORKERS.pop(node_addr, None)
+            
+    global DROPPED_TASKS_COUNT
+    DROPPED_TASKS_COUNT += 1
 
     # Fallback: queue for HTTP heartbeat pickup
     PENDING_TASKS[manifest.task_id] = task_dict
@@ -375,9 +398,43 @@ def health_check():
     }
 
 
+@app.get("/admin/nodes")
+def admin_get_nodes():
+    import time
+    now = time.time()
+    nodes = []
+    for node_id, data in ACTIVE_WORKERS.items():
+        last_beat = data.get("last_heartbeat", 0)
+        status = "ONLINE" if (now - last_beat) <= 10 else "LOST"
+        nodes.append({
+            "node_id": node_id,
+            "vault": data.get("vault", ""),
+            "status": status,
+            "last_heartbeat": last_beat,
+            "hardware": data.get("hardware", {})
+        })
+    return {"nodes": nodes}
+
+
+@app.get("/admin/queues")
+def admin_get_queues():
+    return {
+        "pending_tasks": len(PENDING_TASKS) + len(PENDING_DEPOSITS),
+        "completed_tasks": len(COMPLETED_TASKS),
+        "requeued_tasks": DROPPED_TASKS_COUNT,
+        "domain_health": DOMAIN_STATS
+    }
+
+
 @app.post("/orchestrate")
 def orchestrate(request: OrchestrateRequest):
     print(f"Received Orchestration Request for domain: {request.domain}")
+
+    # Track Domain Usage
+    domain_key = "Web3" if request.domain in ("web3", "Web3 & DeFi") else \
+                 "Code" if request.domain == "Code & Dev" else \
+                 "Media" if request.domain == "Media" else "Utility"
+    DOMAIN_STATS[domain_key] = DOMAIN_STATS.get(domain_key, 0) + 1
 
     system_prompt = """You are the Autonome Orchestrator Brain.
 You receive a raw user intent and must extract the parameters needed for specialized sub-agents.
