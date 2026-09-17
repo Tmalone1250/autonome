@@ -237,16 +237,20 @@ async def connect_to_orchestrator():
                         # Orchestrator settled on-chain — write tx_hash to local SQLite
                         t_id    = data.get("task_id", "")
                         tx_hash = data.get("tx_hash", "")
+                        error   = data.get("error", "")
+                        
+                        final_status = "Settled" if not error else "Failed"
+                        
                         try:
                             conn = sqlite3.connect(DB_PATH)
                             cursor = conn.cursor()
                             cursor.execute(
                                 "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
-                                (tx_hash, "Settled", t_id),
+                                (tx_hash, final_status, t_id),
                             )
                             conn.commit()
                             conn.close()
-                            print(f"[Worker] Settlement logged — tx: {tx_hash}")
+                            print(f"[Worker] Settlement logged — tx: {tx_hash} | status: {final_status}")
                         except Exception as e:
                             print(f"[Worker] Failed to update local DB: {e}")
 
