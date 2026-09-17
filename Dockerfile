@@ -1,19 +1,16 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+WORKDIR /app/autonome
 
-# ── Step 1: Install botchain-sdk-py (local package, lives one level above autonome) ──
-COPY botchain-sdk-py/ ./botchain-sdk-py/
-RUN pip install --no-cache-dir ./botchain-sdk-py
+# ── Step 1: Install botchain-sdk-py directly from GitHub main branch archive ──
+RUN pip install --no-cache-dir https://github.com/Tmalone1250/botchain-sdk-py/archive/refs/heads/main.zip
 
 # ── Step 2: Install autonome Python dependencies ──
-COPY autonome/requirements.txt ./autonome/requirements.txt
-RUN pip install --no-cache-dir -r ./autonome/requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Step 3: Copy autonome source ──
-COPY autonome/ ./autonome/
-
-WORKDIR /app/autonome
+# ── Step 3: Copy entire autonome workspace ──
+COPY . .
 
 ENV PYTHONPATH=/app/autonome
 ENV OLLAMA_HOST="http://127.0.0.1:11434"
