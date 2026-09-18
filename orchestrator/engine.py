@@ -79,7 +79,11 @@ app = FastAPI(title="Autonome Orchestrator", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://autonome.live", 
+        "https://www.autonome.live"
+        ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

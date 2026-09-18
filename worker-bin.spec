@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import copy_metadata
 
 datas = []
 binaries = []
-hiddenimports = ['web3', 'eth_account']
+hiddenimports = ['web3', 'eth_account', 'websockets', 'websockets.legacy', 'websockets.legacy.client']
 datas += copy_metadata('py_ecc')
 tmp_ret = collect_all('eth_account')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
