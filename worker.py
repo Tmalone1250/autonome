@@ -229,9 +229,15 @@ async def connect_to_orchestrator():
                         try:
                             await asyncio.sleep(5)
                             hw = get_node_status().get("hardware", {})
+                            print(f"[Worker WS DEBUG] Sending ping: {hw}")
                             await ws.send(json.dumps({"type": "ping", "hardware": hw}))
-                        except Exception:
+                            print(f"[Worker WS DEBUG] Ping sent successfully.")
+                        except websockets.exceptions.ConnectionClosed:
                             break
+                        except Exception as e:
+                            print(f"[Worker WS ERROR] Ping loop exception: {e}")
+                            import traceback
+                            traceback.print_exc()
 
                 heartbeat_task = asyncio.create_task(send_heartbeat())
 

@@ -222,6 +222,7 @@ async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""
     try:
         while True:
             raw = await websocket.receive_text()
+            print(f"[Orchestrator WS DEBUG] Received raw message from {node}: {raw}")
             data = json.loads(raw)
             msg_type = data.get("type", "")
 
