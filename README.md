@@ -87,6 +87,8 @@ autonome/
 | `/prompt` | `POST` | Primary entrypoint for user prompts. Parses intent, delegates to sub-agents, triggers worker, and settles on-chain. | `{"prompt": "string"}` |
 | `/tasks` | `GET` | Retrieves full listing of orchestrator execution logs and settlement records. | N/A |
 | `/health` | `GET` | System health check and model connectivity status. | N/A |
+| `/admin/nodes` | `GET` | (Protected) Retrieves the full registry of connected worker nodes, capabilities, and health status. | N/A |
+| `/admin/queues` | `GET` | (Protected) Retrieves queue metrics and task orchestration routing status. | N/A |
 
 ### Worker Node Endpoints (`http://localhost:8000`)
 
