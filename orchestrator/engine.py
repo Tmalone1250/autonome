@@ -5,7 +5,7 @@ import asyncio
 import secrets
 import signal
 import time
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import redis.asyncio as redis
@@ -216,6 +216,69 @@ async def get_task_status(task_id: str):
     if processing:
         return {"status": "processing"}
     return {"status": "pending"}
+
+@app.websocket("/ws/worker")
+async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""):
+    await websocket.accept()
+    if not node:
+        node = "legacy_node_" + secrets.token_hex(4)
+    print(f"[Orchestrator] Legacy WebSocket connected: {node}")
+    try:
+        while True:
+            # Emulate heartbeat
+            now = time.time()
+            await redis_client.hset("active_workers", node, now)
+            if vault:
+                await redis_client.set(f"worker_vault:{node}", vault)
+            await redis_client.set(f"worker_hw:{node}", json.dumps({"legacy": True}))
+            
+            # Try to pop a task for this worker
+            task_json = await redis_client.lpop("tasks:pending")
+            if task_json:
+                task_data = json.loads(task_json)
+                if not task_data.get("operator_vault") or task_data["operator_vault"] == "0x0000000000000000000000000000000000000000":
+                    task_data["operator_vault"] = vault
+                
+                await redis_client.hset("tasks:processing", task_data["task_id"], json.dumps(task_data))
+                await websocket.send_json(task_data)
+                print(f"[Orchestrator] Legacy WS sent task {task_data['task_id']} to {node}")
+                
+            try:
+                # Wait for any incoming messages (like task completion) with a timeout
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=3.0)
+                try:
+                    result_data = json.loads(msg)
+                    if "task_id" in result_data and "inference_result" in result_data:
+                        t_id = result_data["task_id"]
+                        sub_agent = result_data.get("sub_agent", "")
+                        operator_vault = result_data.get("operator_vault", vault)
+                        asyncio.create_task(_process_legacy_completion(result_data, t_id, sub_agent, operator_vault))
+                except json.JSONDecodeError:
+                    pass
+            except asyncio.TimeoutError:
+                pass
+    except WebSocketDisconnect:
+        await redis_client.hdel("active_workers", node)
+        print(f"[Orchestrator] Legacy WebSocket disconnected: {node}")
+    except Exception as e:
+        print(f"[Orchestrator] Legacy WS error: {e}")
+        try:
+            await redis_client.hdel("active_workers", node)
+        except:
+            pass
+
+async def _process_legacy_completion(req, t_id, sub_agent, operator_vault):
+    settlement = await _settle_async(t_id, sub_agent, operator_vault)
+    result_data = {
+        "inference_result": req.get("inference_result", ""),
+        "proof_hash": req.get("proof_hash", ""),
+        "settlement_tx_hash": settlement["tx_hash"],
+        "error": settlement["error"],
+    }
+    await redis_client.hset("tasks:completed", t_id, json.dumps(result_data))
+    await redis_client.hdel("tasks:processing", t_id)
+    print(f"[Orchestrator] Legacy WS completed task {t_id}")
+
 
 @app.post("/tasks/complete")
 async def complete_task(req: CompleteTaskRequest):
