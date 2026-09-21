@@ -12,6 +12,8 @@ services:
       - OLLAMA_HOST=${OLLAMA_HOST:-http://127.0.0.1:11434}
       - WORKER_URL=http://127.0.0.1:8000
       - REDIS_URL=redis://127.0.0.1:6379/0
+    depends_on:
+      - redis
     restart: unless-stopped
 
   autonome-scheduler:
@@ -25,6 +27,8 @@ services:
       - .env
     environment:
       - REDIS_URL=redis://127.0.0.1:6379/0
+    depends_on:
+      - redis
     restart: unless-stopped
 
   redis:
