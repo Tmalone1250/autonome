@@ -148,12 +148,45 @@ def _run_settlement_sync(t_id: str, sub_agent: str, operator_vault: str) -> dict
         task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
         sub_agent_addr = w3.to_checksum_address(sub_agent)
         vault_addr = w3.to_checksum_address(operator_vault)
+        amount = w3.to_wei(10, 'ether')
+        
+        atma_contract = w3.eth.contract(address=w3.to_checksum_address(ATMA_TOKEN_ADDRESS), abi=ERC20_ABI)
+        
+        # We will bundle 3 transactions: Approve -> Deposit -> Settle
+        nonce = w3.eth.get_transaction_count(relayer_account.address, 'pending')
+        
+        # 1. Approve
+        approve_tx = atma_contract.functions.approve(
+            w3.to_checksum_address(ESCROW_ADDRESS), amount
+        ).build_transaction({
+            'from': relayer_account.address,
+            'nonce': nonce,
+            'chainId': 968,
+            'gas': 100000,
+            'gasPrice': w3.eth.gas_price
+        })
+        signed_app = w3.eth.account.sign_transaction(approve_tx, private_key=RELAYER_PRIVATE_KEY)
+        w3.eth.send_raw_transaction(signed_app.raw_transaction)
 
+        # 2. Deposit
+        dep_tx = contract.functions.depositIntent(
+            task_id_bytes, amount
+        ).build_transaction({
+            'from': relayer_account.address,
+            'nonce': nonce + 1,
+            'chainId': 968,
+            'gas': 500000,
+            'gasPrice': w3.eth.gas_price
+        })
+        signed_dep = w3.eth.account.sign_transaction(dep_tx, private_key=RELAYER_PRIVATE_KEY)
+        w3.eth.send_raw_transaction(signed_dep.raw_transaction)
+
+        # 3. Settle
         tx_dict = contract.functions.settleTask(
             task_id_bytes, sub_agent_addr, vault_addr
         ).build_transaction({
             "from": relayer_account.address,
-            "nonce": w3.eth.get_transaction_count(relayer_account.address),
+            "nonce": nonce + 2,
             "chainId": 968,
             "gas": 1500000,
             "gasPrice": w3.eth.gas_price,

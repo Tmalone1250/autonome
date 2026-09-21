@@ -10,8 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from botchain.client import BotChain
-from web3 import Web3
-
 import os
 from pathlib import Path
 env_path = Path.home() / ".autonome" / ".env"
@@ -230,7 +228,7 @@ async def http_polling_loop():
     Persistent HTTP polling loop (3s) replacing WebSockets.
     """
     orchestrator_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8002")
-    node_address = Web3().eth.account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
+    node_address = Account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
 
     print(f"[Worker] Starting HTTP Polling Loop to {orchestrator_url}/nodes/heartbeat")
     
@@ -326,7 +324,7 @@ def get_node_status():
     return {
         "status": "ONLINE" if docker_online else "DEGRADED",
         "uptime_seconds": int(time.time() - START_TIME),
-        "node_address": Web3().eth.account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else None,
+        "node_address": Account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else None,
         "operator_vault_debug": CURRENT_VAULT or os.environ.get("OPERATOR_VAULT"),
         "hardware": {
             "cpu_usage_pct": cpu_percent,
