@@ -169,128 +169,96 @@ def execute_docker_sandbox(manifest: dict):
 
 
 import asyncio
-import websockets
 import requests
+import traceback
 
-async def execute_and_report(task: dict, ws):
+async def execute_and_report(task: dict):
     """
     Execute a task in a thread pool (non-blocking) then send the signed
-    proof back to the Orchestrator over the open WebSocket connection.
+    proof back to the Orchestrator over HTTP.
     """
     loop = asyncio.get_event_loop()
+    orchestrator_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8002")
     try:
         result = await loop.run_in_executor(None, execute_docker_sandbox, task)
-        await ws.send(json.dumps({"type": "task_complete", **result}))
-        print(f"[Worker] ✅ Proof submitted for task {task.get('task_id')}")
+        # HTTP POST to /tasks/complete
+        resp = requests.post(f"{orchestrator_url}/tasks/complete", json=result, timeout=60)
+        if resp.status_code == 200:
+            data = resp.json()
+            print(f"[Worker] ✅ Proof submitted for task {task.get('task_id')}")
+            # Update local log with tx_hash
+            tx_hash = data.get("tx_hash", "")
+            error = data.get("error", "")
+            final_status = "Settled" if not error else "Failed"
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
+                    (tx_hash, final_status, task.get("task_id", "")),
+                )
+                conn.commit()
+                conn.close()
+                print(f"[Worker] Settlement logged — tx: {tx_hash} | status: {final_status}")
+            except Exception as e:
+                print(f"[Worker] Failed to update local DB: {e}")
+        else:
+            print(f"[Worker] Failed to submit proof. Orchestrator returned {resp.status_code}")
     except Exception as e:
         print(f"[Worker] execute_and_report error: {e}")
-        # Send an error proof so the Orchestrator doesn't hang
+        # Send an error proof
         try:
-            await ws.send(json.dumps({
-                "type":             "task_complete",
+            error_payload = {
                 "task_id":          task.get("task_id", ""),
                 "inference_result": f"Error: {str(e)}",
                 "proof_hash":       "",
                 "signature":        "",
                 "sub_agent":        task.get("sub_agent", ""),
                 "operator_vault":   task.get("operator_vault", ""),
-            }))
+            }
+            requests.post(f"{orchestrator_url}/tasks/complete", json=error_payload, timeout=10)
         except Exception:
             pass
 
 
-async def connect_to_orchestrator():
+async def http_polling_loop():
     """
-    Persistent outbound WebSocket connection to the Orchestrator.
-    Initiated from the worker so NAT/firewalls are never an issue.
-    Uses exponential backoff (1s → 60s) on disconnect.
+    Persistent HTTP polling loop (3s) replacing WebSockets.
     """
     orchestrator_url = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8002")
-    ws_url = orchestrator_url.replace("http://", "ws://").replace("https://", "wss://")
     node_address = Web3().eth.account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
 
-    backoff = 1
+    print(f"[Worker] Starting HTTP Polling Loop to {orchestrator_url}/nodes/heartbeat")
+    
     while True:
-        vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT", "")
-        full_url = f"{ws_url}/ws/worker?vault={vault}&node={node_address}"
-        print(f"[Worker] Connecting to Orchestrator WebSocket: {full_url}")
         try:
-            async with websockets.connect(
-                full_url,
-                ping_interval=20,
-                ping_timeout=10,
-                open_timeout=10,
-            ) as ws:
-                backoff = 1  # Reset backoff on successful connection
-                print(f"[Worker] ✅ WebSocket connected. Awaiting tasks...")
-                
-                async def send_heartbeat():
-                    while True:
-                        try:
-                            await asyncio.sleep(5)
-                            hw = get_node_status().get("hardware", {})
-                            print(f"[Worker WS DEBUG] Sending ping: {hw}")
-                            await ws.send(json.dumps({"type": "ping", "hardware": hw}))
-                            print(f"[Worker WS DEBUG] Ping sent successfully.")
-                        except websockets.exceptions.ConnectionClosed:
-                            break
-                        except Exception as e:
-                            print(f"[Worker WS ERROR] Ping loop exception: {e}")
-                            import traceback
-                            traceback.print_exc()
-
-                heartbeat_task = asyncio.create_task(send_heartbeat())
-
-                try:
-                    async for raw_message in ws:
-                        data = json.loads(raw_message)
-                        msg_type = data.get("type", "")
-
-                        if msg_type == "task":
-                            print(f"[Worker] ⚡ Task received via WebSocket: {data.get('task_id')}")
-                            # Run in background — keeps WS loop responsive for next task
-                            asyncio.create_task(execute_and_report(data, ws))
-
-                        elif msg_type == "settlement_complete":
-                            # Orchestrator settled on-chain — write tx_hash to local SQLite
-                            t_id    = data.get("task_id", "")
-                            tx_hash = data.get("tx_hash", "")
-                            error   = data.get("error", "")
-                            
-                            final_status = "Settled" if not error else "Failed"
-                            
-                            try:
-                                conn = sqlite3.connect(DB_PATH)
-                                cursor = conn.cursor()
-                                cursor.execute(
-                                    "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
-                                    (tx_hash, final_status, t_id),
-                                )
-                                conn.commit()
-                                conn.close()
-                                print(f"[Worker] Settlement logged — tx: {tx_hash} | status: {final_status}")
-                            except Exception as e:
-                                print(f"[Worker] Failed to update local DB: {e}")
-
-                        elif msg_type == "pong":
-                            pass  # keepalive response — no action needed
-                finally:
-                    heartbeat_task.cancel()
-
-        except (websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.InvalidURI,
-                OSError) as e:
-            print(f"[Worker] WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
+            vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT", "")
+            hw = get_node_status().get("hardware", {})
+            payload = {
+                "node_id": node_address,
+                "vault": vault,
+                "hardware": hw
+            }
+            
+            resp = requests.post(f"{orchestrator_url}/nodes/heartbeat", json=payload, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "task":
+                    task_data = data.get("task", {})
+                    print(f"[Worker] ⚡ Task received via HTTP: {task_data.get('task_id')}")
+                    asyncio.create_task(execute_and_report(task_data))
+        except requests.exceptions.RequestException as e:
+            print(f"[Worker] Heartbeat failed: {e}")
         except Exception as e:
-            print(f"[Worker] Unexpected error: {e}. Reconnecting in {backoff}s...")
+            print(f"[Worker] Unexpected error in polling loop: {e}")
+            traceback.print_exc()
 
-        await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 60)  # Exponential backoff, cap at 60s
+        await asyncio.sleep(3)
 
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(connect_to_orchestrator())
+    asyncio.create_task(http_polling_loop())
 
 
 @app.get("/logs")

@@ -4,14 +4,14 @@ import json
 import asyncio
 import secrets
 import signal
-import socket
-import requests
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+import time
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import redis.asyncio as redis
 
+# Ensure port 8002 is free before app initializes
 def free_port(port: int):
-    """Kill any process holding a given port so we can bind cleanly."""
     try:
         import subprocess
         result = subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True)
@@ -19,26 +19,21 @@ def free_port(port: int):
         for pid in pids:
             try:
                 os.kill(int(pid), signal.SIGKILL)
-                print(f"[Orchestrator] Freed port {port} (killed PID {pid})")
-            except (ProcessLookupError, PermissionError) as e:
-                print(f"[Orchestrator] Could not kill PID {pid}: {e}")
-    except Exception as e:
-        print(f"[Orchestrator] Port-free check skipped: {e}")
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception:
+        pass
 
-# Ensure port 8002 is free before app initializes
 _ORCHESTRATOR_PORT = int(os.environ.get("ORCHESTRATOR_PORT", "8002"))
 free_port(_ORCHESTRATOR_PORT)
 
-# Ensure we can import from autonome/agents
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from agents.bdex_screener import run_agent as bdex_run_agent
+from agents.bdex_screener import build_manifest as bdex_build_manifest
 
 from dotenv import load_dotenv
 load_dotenv()
 RELAYER_PRIVATE_KEY = os.getenv("RELAYER_PRIVATE_KEY")
-if not RELAYER_PRIVATE_KEY:
-    print("Warning: RELAYER_PRIVATE_KEY not set in .env")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 from web3 import Web3
 try:
@@ -52,7 +47,6 @@ except ImportError:
 from eth_account import Account
 Account.enable_unaudited_hdwallet_features()
 
-# Setup Web3 for Bohr Testnet
 w3 = Web3(Web3.HTTPProvider("https://rpc.bohr.life"))
 if poa_middleware:
     w3.middleware_onion.inject(poa_middleware, layer=0)
@@ -75,15 +69,11 @@ ESCROW_ABI = [{
     "type": "function"
 }]
 
-app = FastAPI(title="Autonome Orchestrator", version="2.0.0")
+app = FastAPI(title="Autonome Orchestrator", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://autonome.live", 
-        "https://www.autonome.live"
-        ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,24 +81,19 @@ app.add_middleware(
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
-# ---------------------------------------------------------------------------
-# Task State
-# ---------------------------------------------------------------------------
-PENDING_TASKS: dict = {}   # HTTP fallback queue for non-WS workers
-COMPLETED_TASKS: dict = {} # Finalized results keyed by task_id
-ACTIVE_WORKERS: dict = {}  # {node_address: {"ws": WebSocket, "vault": str, "last_heartbeat": float, "hardware": dict}} — live connections
-PENDING_DEPOSITS: dict = {} # {task_id: asyncio.Task} — tracks active deposit processes
+# Global Redis Client
+redis_client = None
 
-# Admin Telemetry State
-DROPPED_TASKS_COUNT = 0
-DOMAIN_STATS = {
-    "Web3": 0,
-    "Code": 0,
-    "Media": 0,
-    "Utility": 0
-}
+@app.on_event("startup")
+async def startup_event():
+    global redis_client
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    print(f"[Orchestrator] Connected to Redis at {REDIS_URL}")
 
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+@app.on_event("shutdown")
+async def shutdown_event():
+    if redis_client:
+        await redis_client.close()
 
 # ---------------------------------------------------------------------------
 # Models
@@ -120,6 +105,7 @@ class TaskManifest(BaseModel):
     env_vars: dict = {}
     operator_vault: str
     sub_agent: str
+    cost: float = 0.0
 
 class CompleteTaskRequest(BaseModel):
     task_id: str
@@ -134,30 +120,31 @@ class OrchestrateRequest(BaseModel):
     domain: str
     user_address: str
 
+class HeartbeatRequest(BaseModel):
+    node_id: str
+    vault: str
+    hardware: dict
+
+class CreateSessionRequest(BaseModel):
+    agent: str
+    interval: int
+    duration: int
+    parameters: dict
+    operator_vault: str
+    user_address: str
+
 # ---------------------------------------------------------------------------
-# Settlement — runs in a thread executor to avoid blocking the event loop
+# Settlement
 # ---------------------------------------------------------------------------
 def _run_settlement_sync(t_id: str, sub_agent: str, operator_vault: str) -> dict:
-    """
-    Blocking Web3 settlement. Must be called via run_in_executor — never directly
-    from async code, as wait_for_transaction_receipt blocks the thread.
-    """
     tx_hash = ""
     error = ""
-
     if not relayer_account:
         return {"tx_hash": "", "error": "No relayer account configured"}
 
     try:
-        contract = w3.eth.contract(
-            address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI
-        )
-
-        if t_id.startswith("0x"):
-            task_id_bytes = w3.to_bytes(hexstr=t_id)
-        else:
-            task_id_bytes = w3.keccak(text=t_id)
-
+        contract = w3.eth.contract(address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI)
+        task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
         sub_agent_addr = w3.to_checksum_address(sub_agent)
         vault_addr = w3.to_checksum_address(operator_vault)
 
@@ -178,268 +165,214 @@ def _run_settlement_sync(t_id: str, sub_agent: str, operator_vault: str) -> dict
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash_bytes, timeout=30)
         if receipt.status != 1:
             raise RuntimeError(f"Settlement reverted: {tx_hash}")
-
         print(f"[Orchestrator] ✅ Settled {t_id} — tx: {tx_hash}")
-
     except Exception as e:
         error = f"Relayer settlement failed: {str(e)}"
         print(f"[Orchestrator] ❌ {error}")
 
     return {"tx_hash": tx_hash, "error": error}
 
-
 async def _settle_async(t_id: str, sub_agent: str, operator_vault: str) -> dict:
-    """Async wrapper — offloads blocking Web3 call to thread pool."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _run_settlement_sync, t_id, sub_agent, operator_vault)
 
-
 # ---------------------------------------------------------------------------
-# WebSocket Endpoint — primary task dispatch path
+# Task Queue Endpoints (Stateless)
 # ---------------------------------------------------------------------------
-@app.websocket("/ws/worker")
-async def worker_websocket(websocket: WebSocket, vault: str = "", node: str = ""):
-    import time
-    await websocket.accept()
-    # Store both the WS connection and the vault address supplied at connect time
-    ACTIVE_WORKERS[node] = {
-        "ws": websocket, 
-        "vault": vault,
-        "last_heartbeat": time.time(),
-        "hardware": {"cpu": "Unknown", "ram": "Unknown"}
-    }
-    print(f"[Orchestrator] ✅ Worker connected: {node}  vault: {vault}")
-
-    # Drain any tasks queued before this worker came online
-    if PENDING_TASKS:
-        task_id = next(iter(PENDING_TASKS))
-        task = PENDING_TASKS.pop(task_id)
-        if vault and not task.get("operator_vault"):
-            task["operator_vault"] = vault
-        print(f"[Orchestrator] Draining queued task {task_id} → {node}")
-        await websocket.send_json({"type": "task", **task})
-
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            print(f"[Orchestrator WS DEBUG] Received raw message from {node}: {raw}")
-            data = json.loads(raw)
-            msg_type = data.get("type", "")
-
-            if msg_type == "task_complete":
-                t_id = data.get("task_id", "")
-                print(f"[Orchestrator] task_complete received for {t_id} from {node}")
-
-                # Wait for the background deposit to finish mining (if it hasn't already)
-                deposit_task = PENDING_DEPOSITS.pop(t_id, None)
-                if deposit_task:
-                    print(f"[Orchestrator] Awaiting deposit confirmation for {t_id} before settling...")
-                    await deposit_task
-
-                # Settle on-chain without blocking the event loop
-                settlement = await _settle_async(
-                    t_id,
-                    data.get("sub_agent", ""),
-                    data.get("operator_vault", "")
-                )
-
-                COMPLETED_TASKS[t_id] = {
-                    "inference_result": data.get("inference_result", ""),
-                    "proof_hash":       data.get("proof_hash", ""),
-                    "settlement_tx_hash": settlement["tx_hash"],
-                    "error":            settlement["error"],
-                }
-
-                # Notify worker so it can update its local SQLite log
-                await websocket.send_json({
-                    "type":    "settlement_complete",
-                    "task_id": t_id,
-                    "tx_hash": settlement["tx_hash"],
-                    "error":   settlement["error"],
-                })
-
-            elif msg_type == "ping":
-                import time
-                ACTIVE_WORKERS[node]["last_heartbeat"] = time.time()
-                hardware = data.get("hardware", {})
-                if hardware:
-                    ACTIVE_WORKERS[node]["hardware"] = hardware
-                await websocket.send_json({"type": "pong"})
-
-    except WebSocketDisconnect:
-        ACTIVE_WORKERS.pop(node, None)
-        print(f"[Orchestrator] Worker disconnected: {node}")
-    except Exception as e:
-        ACTIVE_WORKERS.pop(node, None)
-        print(f"[Orchestrator] WebSocket error ({node}): {e}")
-
-
-def _resolve_vault(manifest_vault: str) -> str:
-    """
-    Return the best available vault address.
-    Prefer the vault registered by a live WebSocket worker over whatever
-    bdex_screener.py injected (which may be the zero address when the VPS
-    cannot reach the worker's /status endpoint at 127.0.0.1:8000).
-    """
-    for entry in ACTIVE_WORKERS.values():
-        v = entry.get("vault", "")
-        if v and v.startswith("0x") and len(v) == 42 and v != ZERO_ADDRESS:
-            return v
-    return manifest_vault
-
-
-# ---------------------------------------------------------------------------
-# Task Queue Endpoints
-# ---------------------------------------------------------------------------
-async def run_deposit_async(task_id: str):
-    try:
-        deposit_script = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "deposit_task.py")
-        )
-        proc = await asyncio.create_subprocess_exec(
-            "python3", deposit_script, task_id,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            print(f"[Orchestrator] ❌ Deposit failed for {task_id}: {stderr.decode()}")
-        else:
-            print(f"[Orchestrator] 💰 Deposit confirmed for {task_id}")
-    except Exception as e:
-        print(f"[Orchestrator] ❌ Deposit script exception for {task_id}: {e}")
-
 @app.post("/tasks/enqueue")
 async def enqueue_task(manifest: TaskManifest):
-    task_dict = manifest.dict()
-
-    # Inject the correct vault — overrides zero-address fallback from bdex_screener
-    resolved_vault = _resolve_vault(task_dict.get("operator_vault", ""))
-    task_dict["operator_vault"] = resolved_vault
-    print(f"[Orchestrator] 🔑 Vault resolved: {resolved_vault}")
-
-    # Launch deposit script asynchronously and track the task
-    PENDING_DEPOSITS[manifest.task_id] = asyncio.create_task(run_deposit_async(manifest.task_id))
-    print(f"[Orchestrator] 💰 True Pipelining: Deposit task started for {manifest.task_id}")
-
-    # Push directly to a live WebSocket worker (sub-50ms dispatch)
-    for node_addr, entry in list(ACTIVE_WORKERS.items()):
-        ws = entry["ws"]
-        try:
-            await ws.send_json({"type": "task", **task_dict})
-            print(f"[Orchestrator] ⚡ Pushed {manifest.task_id} via WS → {node_addr}")
-            return {"status": "enqueued", "task_id": manifest.task_id}
-        except Exception:
-            # Stale connection — remove and try next
-            ACTIVE_WORKERS.pop(node_addr, None)
-            
-    global DROPPED_TASKS_COUNT
-    DROPPED_TASKS_COUNT += 1
-
-    # Fallback: queue for HTTP heartbeat pickup
-    PENDING_TASKS[manifest.task_id] = task_dict
-    print(f"[Orchestrator] No WS workers online. Task {manifest.task_id} queued for HTTP pickup.")
+    await redis_client.rpush("tasks:pending", json.dumps(manifest.dict()))
+    print(f"[Orchestrator] Task {manifest.task_id} enqueued globally.")
     return {"status": "enqueued", "task_id": manifest.task_id}
 
-
-@app.get("/nodes/heartbeat")
-def node_heartbeat(vault: str = "", node: str = ""):
-    """HTTP fallback heartbeat — retained for backward compatibility."""
-    if not PENDING_TASKS:
-        return {"status": "idle"}
-    task_id = next(iter(PENDING_TASKS))
-    task = PENDING_TASKS.pop(task_id)
-    if vault and not task.get("operator_vault"):
-        task["operator_vault"] = vault
-    return task
-
+@app.post("/nodes/heartbeat")
+async def node_heartbeat(req: HeartbeatRequest):
+    now = time.time()
+    await redis_client.hset("active_workers", req.node_id, now)
+    await redis_client.set(f"worker_vault:{req.node_id}", req.vault)
+    await redis_client.set(f"worker_hw:{req.node_id}", json.dumps(req.hardware))
+    
+    # Try to pop a task
+    task_json = await redis_client.lpop("tasks:pending")
+    if task_json:
+        task_data = json.loads(task_json)
+        # Inherit node vault if task vault is empty or zero
+        if not task_data.get("operator_vault") or task_data["operator_vault"] == "0x0000000000000000000000000000000000000000":
+            task_data["operator_vault"] = req.vault
+        
+        # Keep track of processing tasks
+        await redis_client.hset("tasks:processing", task_data["task_id"], json.dumps(task_data))
+        return {"status": "task", "task": task_data}
+    
+    return {"status": "idle"}
 
 @app.get("/tasks/status/{task_id}")
-def get_task_status(task_id: str):
-    if task_id in COMPLETED_TASKS:
-        return {"status": "completed", "result": COMPLETED_TASKS[task_id]}
-    if task_id in PENDING_TASKS:
-        return {"status": "pending"}
-    return {"status": "processing"}
-
+async def get_task_status(task_id: str):
+    completed = await redis_client.hget("tasks:completed", task_id)
+    if completed:
+        return {"status": "completed", "result": json.loads(completed)}
+    processing = await redis_client.hget("tasks:processing", task_id)
+    if processing:
+        return {"status": "processing"}
+    return {"status": "pending"}
 
 @app.post("/tasks/complete")
-async def complete_task(request: CompleteTaskRequest):
-    """HTTP fallback completion — for workers still using HTTP heartbeat."""
-    t_id = request.task_id
-
-    # Wait for the background deposit to finish mining (if it hasn't already)
-    deposit_task = PENDING_DEPOSITS.pop(t_id, None)
-    if deposit_task:
-        print(f"[Orchestrator] Awaiting deposit confirmation for {t_id} before settling...")
-        await deposit_task
-
-    settlement = await _settle_async(t_id, request.sub_agent, request.operator_vault)
-
-    COMPLETED_TASKS[t_id] = {
-        "inference_result":   request.inference_result,
-        "proof_hash":         request.proof_hash,
+async def complete_task(req: CompleteTaskRequest):
+    t_id = req.task_id
+    
+    # Check if this is a session tick
+    is_session_tick = "-tick-" in t_id
+    
+    settlement = await _settle_async(t_id, req.sub_agent, req.operator_vault)
+    
+    result_data = {
+        "inference_result": req.inference_result,
+        "proof_hash": req.proof_hash,
         "settlement_tx_hash": settlement["tx_hash"],
-        "error":              settlement["error"],
+        "error": settlement["error"],
     }
+    
+    await redis_client.hset("tasks:completed", t_id, json.dumps(result_data))
+    await redis_client.hdel("tasks:processing", t_id)
+    
+    if is_session_tick:
+        # Handle Session state updates and credit deduction
+        session_id = t_id.split("-tick-")[0]
+        session_data = await redis_client.hgetall(f"session:{session_id}")
+        if session_data:
+            tick_cost = float(session_data.get("cost_per_tick", 0))
+            pre_auth = float(session_data.get("pre_auth_credits", 0))
+            new_pre_auth = max(0, pre_auth - tick_cost)
+            tick_count = int(session_data.get("tick_count", 0)) + 1
+            total_earned = float(session_data.get("total_settled_atma", 0)) + tick_cost
+            
+            await redis_client.hmset(f"session:{session_id}", {
+                "pre_auth_credits": new_pre_auth,
+                "tick_count": tick_count,
+                "total_settled_atma": total_earned,
+                "last_result": json.dumps(result_data)
+            })
+            print(f"[Orchestrator] Session {session_id} tick complete. Credits remaining: {new_pre_auth}")
+
     return {"status": "completed", "task_id": t_id, "tx_hash": settlement["tx_hash"]}
 
+# ---------------------------------------------------------------------------
+# Sessions Endpoints
+# ---------------------------------------------------------------------------
+@app.post("/sessions/create")
+async def create_session(req: CreateSessionRequest):
+    session_id = "0x" + secrets.token_hex(16)
+    
+    # Calculate costs
+    ticks = req.duration // req.interval
+    cost_per_tick = 10.0 # Standardize for now, could be dynamic
+    total_cost = ticks * cost_per_tick
+    
+    now = time.time()
+    
+    session_data = {
+        "user_address": req.user_address,
+        "status": "RUNNING",
+        "agent_image": req.agent,
+        "agent_env": json.dumps(req.parameters),
+        "operator_vault": req.operator_vault,
+        "sub_agent": "0x0000000000000000000000000000000000000000",
+        "interval_seconds": req.interval,
+        "duration_seconds": req.duration,
+        "started_at": now,
+        "next_tick_at": now,
+        "tick_count": 0,
+        "total_settled_atma": 0.0,
+        "pre_auth_credits": total_cost,
+        "cost_per_tick": cost_per_tick,
+        "last_result": ""
+    }
+    
+    await redis_client.hmset(f"session:{session_id}", session_data)
+    await redis_client.zadd("active_session_ticks", {session_id: now})
+    await redis_client.sadd(f"user_sessions:{req.user_address}", session_id)
+    
+    print(f"[Orchestrator] Created Session {session_id} for {req.duration}s. Pre-auth: {total_cost} credits.")
+    return {"status": "created", "session_id": session_id, "pre_auth_credits": total_cost}
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    data = await redis_client.hgetall(f"session:{session_id}")
+    if not data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return data
+
+@app.patch("/sessions/{session_id}/pause")
+async def pause_session(session_id: str):
+    data = await redis_client.hgetall(f"session:{session_id}")
+    if not data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    new_status = "PAUSED" if data["status"] == "RUNNING" else "RUNNING"
+    await redis_client.hset(f"session:{session_id}", "status", new_status)
+    
+    if new_status == "RUNNING":
+        # Resume tick
+        await redis_client.zadd("active_session_ticks", {session_id: time.time()})
+    else:
+        await redis_client.zrem("active_session_ticks", session_id)
+        
+    return {"status": new_status, "session_id": session_id}
+
+@app.delete("/sessions/{session_id}")
+async def cancel_session(session_id: str):
+    await redis_client.hset(f"session:{session_id}", "status", "CANCELLED")
+    await redis_client.zrem("active_session_ticks", session_id)
+    return {"status": "cancelled", "session_id": session_id}
 
 # ---------------------------------------------------------------------------
 # Health & Orchestration
 # ---------------------------------------------------------------------------
 @app.get("/health")
 @app.get("/")
-def health_check():
+async def health_check():
+    active_workers = await redis_client.hlen("active_workers")
+    pending = await redis_client.llen("tasks:pending")
     return {
-        "status":          "ok",
-        "service":         "Autonome Orchestrator",
-        "version":         "2.0.0",
-        "port":            _ORCHESTRATOR_PORT,
-        "relayer_address": relayer_account.address if relayer_account else None,
-        "ollama_host":     OLLAMA_HOST,
-        "active_workers":  len(ACTIVE_WORKERS),
-        "pending_tasks":   len(PENDING_TASKS),
+        "status": "ok",
+        "service": "Autonome Orchestrator",
+        "version": "2.1.0 (Stateless)",
+        "active_workers": active_workers,
+        "pending_tasks": pending,
     }
 
-
 @app.get("/admin/nodes")
-def admin_get_nodes():
-    import time
+async def admin_get_nodes():
     now = time.time()
+    workers = await redis_client.hgetall("active_workers")
     nodes = []
-    for node_id, data in ACTIVE_WORKERS.items():
-        last_beat = data.get("last_heartbeat", 0)
-        status = "ONLINE" if (now - last_beat) <= 10 else "LOST"
+    for node_id, last_beat in workers.items():
+        vault = await redis_client.get(f"worker_vault:{node_id}") or ""
+        hw_raw = await redis_client.get(f"worker_hw:{node_id}")
+        hw = json.loads(hw_raw) if hw_raw else {}
         nodes.append({
             "node_id": node_id,
-            "vault": data.get("vault", ""),
-            "status": status,
-            "last_heartbeat": last_beat,
-            "hardware": data.get("hardware", {})
+            "vault": vault,
+            "status": "ONLINE", # watchdog removes them if LOST
+            "last_heartbeat": float(last_beat),
+            "hardware": hw
         })
     return {"nodes": nodes}
 
-
 @app.get("/admin/queues")
-def admin_get_queues():
+async def admin_get_queues():
+    pending = await redis_client.llen("tasks:pending")
+    completed = await redis_client.hlen("tasks:completed")
+    processing = await redis_client.hlen("tasks:processing")
     return {
-        "pending_tasks": len(PENDING_TASKS) + len(PENDING_DEPOSITS),
-        "completed_tasks": len(COMPLETED_TASKS),
-        "requeued_tasks": DROPPED_TASKS_COUNT,
-        "domain_health": DOMAIN_STATS
+        "pending_tasks": pending,
+        "processing_tasks": processing,
+        "completed_tasks": completed,
     }
 
-
 @app.post("/orchestrate")
-def orchestrate(request: OrchestrateRequest):
+async def orchestrate(request: OrchestrateRequest):
     print(f"Received Orchestration Request for domain: {request.domain}")
-
-    # Track Domain Usage
-    domain_key = "Web3" if request.domain in ("web3", "Web3 & DeFi") else \
-                 "Code" if request.domain == "Code & Dev" else \
-                 "Media" if request.domain == "Media" else "Utility"
-    DOMAIN_STATS[domain_key] = DOMAIN_STATS.get(domain_key, 0) + 1
 
     system_prompt = """You are the Autonome Orchestrator Brain.
 You receive a raw user intent and must extract the parameters needed for specialized sub-agents.
@@ -463,18 +396,20 @@ Return ONLY a strictly valid JSON object (no markdown, no extra text) with the f
     }
 
     try:
-        response = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=60)
-        response.raise_for_status()
-        result_json = response.json()
-        parsed_intent = json.loads(result_json["message"]["content"])
+        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=60)
+        resp.raise_for_status()
+        parsed_intent = json.loads(resp.json()["message"]["content"])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ollama Parsing Failed: {str(e)}")
 
     task_id = "0x" + secrets.token_hex(32)
 
     if request.domain in ("web3", "Web3 & DeFi"):
-        print(f"Routing task {task_id} to BDEX Screener Sub-Agent...")
-        sub_agent_result = bdex_run_agent(task_id, parsed_intent.get("parameters", {}), request.prompt)
+        sub_agent_result = bdex_build_manifest(task_id, parsed_intent.get("parameters", {}), request.prompt)
+        if "manifest" in sub_agent_result:
+            manifest_dict = sub_agent_result.pop("manifest")
+            await redis_client.rpush("tasks:pending", json.dumps(manifest_dict))
+            print(f"[Orchestrator] Task {task_id} successfully queued to tasks:pending")
     else:
         sub_agent_result = {"error": f"No active sub-agent for domain: {request.domain}"}
 

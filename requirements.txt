@@ -9,3 +9,5 @@ eth-account
 psutil
 docker
 pyinstaller
+redis
+arq

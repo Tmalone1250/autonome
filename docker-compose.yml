@@ -11,6 +11,26 @@ services:
     environment:
       - OLLAMA_HOST=${OLLAMA_HOST:-http://127.0.0.1:11434}
       - WORKER_URL=http://127.0.0.1:8000
+      - REDIS_URL=redis://127.0.0.1:6379/0
+    restart: unless-stopped
+
+  autonome-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: autonome_scheduler
+    command: ["arq", "orchestrator.scheduler.WorkerSettings"]
+    network_mode: "host"
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://127.0.0.1:6379/0
+    restart: unless-stopped
+
+  redis:
+    image: redis:alpine
+    container_name: autonome_redis
+    network_mode: "host"
     restart: unless-stopped
 
   autonome-worker:

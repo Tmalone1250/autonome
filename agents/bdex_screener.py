@@ -90,10 +90,10 @@ def get_onchain_quote(amount_in_wbot: float) -> float:
         print(f"Failed to fetch quote: {e}")
         return 0.0
 
-def run_agent(task_id: str, parameters: dict, prompt_intent: str) -> dict:
+def build_manifest(task_id: str, parameters: dict, prompt_intent: str) -> dict:
     """
     Callable sub-agent entry point.
-    Receives parsed intent, fetches on-chain context, formats the payload, and dispatches to the Compute Node.
+    Receives parsed intent, fetches on-chain context, and returns the formatted payload.
     """
     print(f"--- BDEX Screener Sub-Agent (Dual-Chain Aware) ---")
     
@@ -118,31 +118,18 @@ def run_agent(task_id: str, parameters: dict, prompt_intent: str) -> dict:
     # The worker can also supply this during the heartbeat if empty.
     operator_vault = get_operator_vault()
 
-    # 4. Enqueue to Orchestrator Pull Queue
+    # 4. Return manifest to Orchestrator (removing the circular HTTP call)
     payload = {
         "task_id": task_id,
         "domain": "Web3 & DeFi",
         "image": "alpine",
         "env_vars": {"PROMPT": enriched_prompt},
         "operator_vault": operator_vault or "0x0000000000000000000000000000000000000000",
-        "sub_agent": SUB_AGENT_ADDRESS
+        "sub_agent": SUB_AGENT_ADDRESS,
+        "cost": 1.0  # One-shot task cost
     }
     
-    import time
-    enqueue_url = "http://127.0.0.1:8002/tasks/enqueue"
-    status_url = f"http://127.0.0.1:8002/tasks/status/{task_id}"
-
-    print(f"Enqueuing task {task_id} for Pull Workers ...")
-    try:
-        response = requests.post(enqueue_url, json=payload, timeout=5)
-        if response.status_code != 200:
-            return {"error": f"Orchestrator Enqueue Error: {response.text}"}
-        
-        print("\n✅ Task Successfully Enqueued for Pull Workers!")
-        return {"status": "enqueued", "task_id": task_id}
-
-    except requests.exceptions.RequestException as e:
-        return {"error": f"Failed to enqueue task: {e}"}
+    return {"status": "enqueued", "task_id": task_id, "manifest": payload}
 
 if __name__ == "__main__":
     # Test execution
