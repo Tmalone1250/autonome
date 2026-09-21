@@ -12,7 +12,11 @@ from dotenv import load_dotenv
 from botchain.client import BotChain
 from web3 import Web3
 
-load_dotenv()
+import os
+from pathlib import Path
+env_path = Path.home() / ".autonome" / ".env"
+load_dotenv(dotenv_path=env_path)
+load_dotenv() # Fallback to current directory
 
 import json
 from pathlib import Path
