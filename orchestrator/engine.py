@@ -396,10 +396,23 @@ Return ONLY a strictly valid JSON object (no markdown, no extra text) with the f
     }
 
     try:
-        resp = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=60)
+        import functools
+        import re
+        loop = asyncio.get_event_loop()
+        req_func = functools.partial(requests.post, f"{OLLAMA_HOST}/api/chat", json=payload, timeout=60)
+        resp = await loop.run_in_executor(None, req_func)
         resp.raise_for_status()
-        parsed_intent = json.loads(resp.json()["message"]["content"])
+        
+        raw_content = resp.json()["message"]["content"]
+        print(f"[Orchestrator] Raw Ollama response: {raw_content}")
+        
+        # Clean markdown if present
+        json_match = re.search(r'\{.*\}', raw_content, re.DOTALL)
+        clean_json = json_match.group(0) if json_match else raw_content
+        
+        parsed_intent = json.loads(clean_json)
     except Exception as e:
+        print(f"[Orchestrator] Ollama parsing error: {e}")
         raise HTTPException(status_code=500, detail=f"Ollama Parsing Failed: {str(e)}")
 
     task_id = "0x" + secrets.token_hex(32)
