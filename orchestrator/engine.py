@@ -58,17 +58,46 @@ else:
     relayer_account = None
 
 ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
-ESCROW_ABI = [{
-    "inputs": [
-        {"internalType": "bytes32", "name": "taskId", "type": "bytes32"},
-        {"internalType": "address", "name": "subAgent", "type": "address"},
-        {"internalType": "address", "name": "computeNode", "type": "address"}
-    ],
-    "name": "settleTask",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-}]
+ATMA_TOKEN_ADDRESS = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
+
+ESCROW_ABI = [
+    {
+        "inputs": [
+            {"internalType": "bytes32", "name": "taskId", "type": "bytes32"},
+            {"internalType": "address", "name": "subAgent", "type": "address"},
+            {"internalType": "address", "name": "computeNode", "type": "address"}
+        ],
+        "name": "settleTask",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"internalType": "bytes32", "name": "taskId", "type": "bytes32"},
+            {"internalType": "uint256", "name": "amount", "type": "uint256"}
+        ],
+        "name": "depositIntent",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+]
+
+ERC20_ABI = [
+    {
+        "constant": False,
+        "inputs": [
+            {"name": "_spender", "type": "address"},
+            {"name": "_value", "type": "uint256"}
+        ],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "payable": False,
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+]
 
 app = FastAPI(title="Autonome Orchestrator", version="2.1.0")
 
