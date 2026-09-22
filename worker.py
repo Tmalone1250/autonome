@@ -144,7 +144,7 @@ def execute_docker_sandbox(manifest: dict):
                 int(time.time()),
                 manifest.get("domain", ""),
                 proof_hash,
-                "",
+                "PENDING",
                 "+1.5 ATMA", 
                 "Executed"
             ))
@@ -255,7 +255,7 @@ async def http_polling_loop():
                 conn = sqlite3.connect(DB_PATH)
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                cursor.execute("SELECT task_id FROM execution_logs WHERE tx_hash IN ('PENDING', 'Pending...')")
+                cursor.execute("SELECT task_id FROM execution_logs WHERE tx_hash IN ('', 'PENDING', 'Pending...')")
                 pending_tasks = cursor.fetchall()
                 for row in pending_tasks:
                     t_id = row['task_id']

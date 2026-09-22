@@ -42,8 +42,8 @@ async def watchdog_task(ctx):
                 leased_at = entry.get("leased_at", 0)
                 payload = entry.get("payload")
                 
-                # Orphan condition: Node is dead OR lease is older than 15s
-                if node_id in dead_nodes or (now - float(leased_at) > 15):
+                # Orphan condition: Node is dead OR lease is older than 300s
+                if node_id in dead_nodes or (now - float(leased_at) > 300):
                     print(f"[Scheduler] Requeuing orphaned task {t_id} from node {node_id}")
                     await redis_client.hdel("tasks:processing", t_id)
                     # Requeue at the front of the line
