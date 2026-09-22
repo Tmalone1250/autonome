@@ -266,11 +266,23 @@ async def http_polling_loop():
                             res_dict = status_data.get("result", {})
                             real_tx = res_dict.get("settlement_tx_hash", "PENDING")
                             err = res_dict.get("error", "")
+                            if err:
+                                real_tx = "Failed"
                             if real_tx not in ("PENDING", "Pending...") or err:
                                 final_status = "Settled" if not err else "Failed"
                                 cursor.execute(
                                     "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
                                     (real_tx, final_status, t_id)
+                                )
+                                conn.commit()
+                        elif status_data.get("status") == "pending":
+                            # Check if the task is a ghost task from legacy WS
+                            cursor.execute("SELECT timestamp FROM execution_logs WHERE task_id = ?", (t_id,))
+                            ts_row = cursor.fetchone()
+                            if ts_row and (time.time() - ts_row['timestamp']) > 300:
+                                cursor.execute(
+                                    "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
+                                    ("Failed", "Failed", t_id)
                                 )
                                 conn.commit()
                 conn.close()
