@@ -171,10 +171,10 @@ async def master_relayer_task(ctx):
         operator_vault = payload["operator_vault"]
         
         try:
-            print(f"[Relayer] Processing settlement for {t_id}")
+            print(f"[Relayer] Processing settlement for {t_id}", flush=True)
             task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
-            sub_agent_addr = w3.to_checksum_address(sub_agent)
-            vault_addr = w3.to_checksum_address(operator_vault)
+            sub_agent_addr = w3.to_checksum_address(sub_agent) if sub_agent else w3.to_checksum_address("0x0000000000000000000000000000000000000000")
+            vault_addr = w3.to_checksum_address(operator_vault) if operator_vault else w3.to_checksum_address("0x0000000000000000000000000000000000000000")
             amount = w3.to_wei(10, 'ether')
             
             nonce = w3.eth.get_transaction_count(relayer_account.address, 'pending')
