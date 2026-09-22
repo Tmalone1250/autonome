@@ -249,6 +249,34 @@ async def http_polling_loop():
                     task_data = data.get("task", {})
                     print(f"[Worker] ⚡ Task received via HTTP: {task_data.get('task_id')}")
                     asyncio.create_task(execute_and_report(task_data))
+            
+            # Sync PENDING logs from Orchestrator
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT task_id FROM execution_logs WHERE tx_hash IN ('PENDING', 'Pending...')")
+                pending_tasks = cursor.fetchall()
+                for row in pending_tasks:
+                    t_id = row['task_id']
+                    status_resp = requests.get(f"{orchestrator_url}/tasks/status/{t_id}", timeout=5)
+                    if status_resp.status_code == 200:
+                        status_data = status_resp.json()
+                        if status_data.get("status") == "completed":
+                            res_dict = status_data.get("result", {})
+                            real_tx = res_dict.get("settlement_tx_hash", "PENDING")
+                            err = res_dict.get("error", "")
+                            if real_tx not in ("PENDING", "Pending...") or err:
+                                final_status = "Settled" if not err else "Failed"
+                                cursor.execute(
+                                    "UPDATE execution_logs SET tx_hash = ?, status = ? WHERE task_id = ?",
+                                    (real_tx, final_status, t_id)
+                                )
+                                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"[Worker] Error syncing pending logs: {e}")
+
         except requests.exceptions.RequestException as e:
             print(f"[Worker] Heartbeat failed: {e}")
         except Exception as e:
