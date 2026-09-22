@@ -106,7 +106,7 @@ def execute_docker_sandbox(manifest: dict):
             raise HTTPException(status_code=500, detail="Docker client not initialized. Is the socket mounted?")
 
         actual_vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT") or manifest.get("operator_vault", "")
-        print(f"[Worker] Executing task {manifest["task_id"]}")
+        print(f"[Worker] Executing task {manifest.get('task_id', '')}")
         print(f"[Worker] Operator Vault resolved to: {actual_vault}")
 
         # 1. Ephemeral Docker Execution
@@ -124,7 +124,7 @@ def execute_docker_sandbox(manifest: dict):
 
         # 2. Cryptographic Proof
         client = BotChain(private_key=NODE_PRIVATE_KEY, is_testnet=True)
-        payload_str = f"{manifest["task_id"]}:{output_str}"
+        payload_str = f"{manifest.get('task_id', '')}:{output_str}"
         proof_hash = client.w3.keccak(text=payload_str).hex()
         
         message = encode_defunct(text=proof_hash)
