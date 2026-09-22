@@ -166,78 +166,7 @@ class CreateSessionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Settlement
 # ---------------------------------------------------------------------------
-def _run_settlement_sync(t_id: str, sub_agent: str, operator_vault: str) -> dict:
-    tx_hash = ""
-    error = ""
-    if not relayer_account:
-        return {"tx_hash": "", "error": "No relayer account configured"}
-
-    try:
-        contract = w3.eth.contract(address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI)
-        task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
-        sub_agent_addr = w3.to_checksum_address(sub_agent)
-        vault_addr = w3.to_checksum_address(operator_vault)
-        amount = w3.to_wei(10, 'ether')
-        
-        atma_contract = w3.eth.contract(address=w3.to_checksum_address(ATMA_TOKEN_ADDRESS), abi=ERC20_ABI)
-        
-        # We will bundle 3 transactions: Approve -> Deposit -> Settle
-        nonce = w3.eth.get_transaction_count(relayer_account.address, 'pending')
-        
-        # 1. Approve
-        approve_tx = atma_contract.functions.approve(
-            w3.to_checksum_address(ESCROW_ADDRESS), amount
-        ).build_transaction({
-            'from': relayer_account.address,
-            'nonce': nonce,
-            'chainId': 968,
-            'gas': 100000,
-            'gasPrice': w3.eth.gas_price
-        })
-        signed_app = w3.eth.account.sign_transaction(approve_tx, private_key=RELAYER_PRIVATE_KEY)
-        w3.eth.send_raw_transaction(signed_app.raw_transaction)
-
-        # 2. Deposit
-        dep_tx = contract.functions.depositIntent(
-            task_id_bytes, amount
-        ).build_transaction({
-            'from': relayer_account.address,
-            'nonce': nonce + 1,
-            'chainId': 968,
-            'gas': 500000,
-            'gasPrice': w3.eth.gas_price
-        })
-        signed_dep = w3.eth.account.sign_transaction(dep_tx, private_key=RELAYER_PRIVATE_KEY)
-        w3.eth.send_raw_transaction(signed_dep.raw_transaction)
-
-        # 3. Settle
-        tx_dict = contract.functions.settleTask(
-            task_id_bytes, sub_agent_addr, vault_addr
-        ).build_transaction({
-            "from": relayer_account.address,
-            "nonce": nonce + 2,
-            "chainId": 968,
-            "gas": 1500000,
-            "gasPrice": w3.eth.gas_price,
-        })
-
-        signed_tx = w3.eth.account.sign_transaction(tx_dict, private_key=RELAYER_PRIVATE_KEY)
-        tx_hash_bytes = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        tx_hash = w3.to_hex(tx_hash_bytes)
-
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash_bytes, timeout=30)
-        if receipt.status != 1:
-            raise RuntimeError(f"Settlement reverted: {tx_hash}")
-        print(f"[Orchestrator] ✅ Settled {t_id} — tx: {tx_hash}")
-    except Exception as e:
-        error = f"Relayer settlement failed: {str(e)}"
-        print(f"[Orchestrator] ❌ {error}")
-
-    return {"tx_hash": tx_hash, "error": error}
-
-async def _settle_async(t_id: str, sub_agent: str, operator_vault: str) -> dict:
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run_settlement_sync, t_id, sub_agent, operator_vault)
+# Settlement is now handled by the Master Relayer (scheduler.py) asynchronously
 
 # ---------------------------------------------------------------------------
 # Task Queue Endpoints (Stateless)
@@ -263,8 +192,13 @@ async def node_heartbeat(req: HeartbeatRequest):
         if not task_data.get("operator_vault") or task_data["operator_vault"] == "0x0000000000000000000000000000000000000000":
             task_data["operator_vault"] = req.vault
         
-        # Keep track of processing tasks
-        await redis_client.hset("tasks:processing", task_data["task_id"], json.dumps(task_data))
+        # Keep track of processing tasks with lease info
+        processing_entry = {
+            "node_id": req.node_id,
+            "leased_at": now,
+            "payload": task_data
+        }
+        await redis_client.hset("tasks:processing", task_data["task_id"], json.dumps(processing_entry))
         return {"status": "task", "task": task_data}
     
     return {"status": "idle"}
@@ -301,7 +235,12 @@ async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""
                 if not task_data.get("operator_vault") or task_data["operator_vault"] == "0x0000000000000000000000000000000000000000":
                     task_data["operator_vault"] = vault
                 
-                await redis_client.hset("tasks:processing", task_data["task_id"], json.dumps(task_data))
+                processing_entry = {
+                    "node_id": node,
+                    "leased_at": now,
+                    "payload": task_data
+                }
+                await redis_client.hset("tasks:processing", task_data["task_id"], json.dumps(processing_entry))
                 await websocket.send_json(task_data)
                 print(f"[Orchestrator] Legacy WS sent task {task_data['task_id']} to {node}")
                 
@@ -330,12 +269,18 @@ async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""
             pass
 
 async def _process_legacy_completion(req, t_id, sub_agent, operator_vault):
-    settlement = await _settle_async(t_id, sub_agent, operator_vault)
+    settlement_payload = {
+        "task_id": t_id,
+        "sub_agent": sub_agent,
+        "operator_vault": operator_vault
+    }
+    await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
+    
     result_data = {
         "inference_result": req.get("inference_result", ""),
         "proof_hash": req.get("proof_hash", ""),
-        "settlement_tx_hash": settlement["tx_hash"],
-        "error": settlement["error"],
+        "settlement_tx_hash": "PENDING",
+        "error": "",
     }
     await redis_client.hset("tasks:completed", t_id, json.dumps(result_data))
     await redis_client.hdel("tasks:processing", t_id)
@@ -349,13 +294,19 @@ async def complete_task(req: CompleteTaskRequest):
     # Check if this is a session tick
     is_session_tick = "-tick-" in t_id
     
-    settlement = await _settle_async(t_id, req.sub_agent, req.operator_vault)
+    # Push to Master Relayer queue
+    settlement_payload = {
+        "task_id": t_id,
+        "sub_agent": req.sub_agent,
+        "operator_vault": req.operator_vault
+    }
+    await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     
     result_data = {
         "inference_result": req.inference_result,
         "proof_hash": req.proof_hash,
-        "settlement_tx_hash": settlement["tx_hash"],
-        "error": settlement["error"],
+        "settlement_tx_hash": "PENDING",
+        "error": "",
     }
     
     await redis_client.hset("tasks:completed", t_id, json.dumps(result_data))
@@ -380,7 +331,7 @@ async def complete_task(req: CompleteTaskRequest):
             })
             print(f"[Orchestrator] Session {session_id} tick complete. Credits remaining: {new_pre_auth}")
 
-    return {"status": "completed", "task_id": t_id, "tx_hash": settlement["tx_hash"]}
+    return {"status": "completed", "task_id": t_id, "tx_hash": "PENDING"}
 
 # ---------------------------------------------------------------------------
 # Sessions Endpoints

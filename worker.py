@@ -191,7 +191,7 @@ async def execute_and_report(task: dict):
             # Update local log with tx_hash
             tx_hash = data.get("tx_hash", "")
             error = data.get("error", "")
-            final_status = "Settled" if not error else "Failed"
+            final_status = "Queued for Settlement" if tx_hash == "PENDING" else ("Settled" if not error else "Failed")
             try:
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
@@ -201,7 +201,7 @@ async def execute_and_report(task: dict):
                 )
                 conn.commit()
                 conn.close()
-                print(f"[Worker] Settlement logged — tx: {tx_hash} | status: {final_status}")
+                print(f"[Worker] Task result submitted. On-chain settlement is {final_status}.")
             except Exception as e:
                 print(f"[Worker] Failed to update local DB: {e}")
         else:

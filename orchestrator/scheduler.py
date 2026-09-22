@@ -4,6 +4,8 @@ import time
 import json
 from arq import cron
 import redis.asyncio as redis
+from web3 import Web3
+from eth_account import Account
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
@@ -13,18 +15,44 @@ async def get_redis_pool() -> redis.Redis:
 async def watchdog_task(ctx):
     """
     Cleans up dead workers (no heartbeat in last 10s)
+    and requeues any orphaned tasks they were processing.
     """
     redis_client: redis.Redis = ctx['redis']
     now = time.time()
     
     # Get all workers from a Redis Hash containing last_heartbeat
     workers = await redis_client.hgetall("active_workers")
+    dead_nodes = set()
     for node, last_hb in workers.items():
         if now - float(last_hb) > 10:
             print(f"[Scheduler] Worker {node} disconnected. Removing.")
             await redis_client.hdel("active_workers", node)
             # Remove any specific hardware telemetry stored for this worker if needed
             await redis_client.delete(f"worker_hw:{node}")
+            dead_nodes.add(node)
+            
+    # Scan tasks:processing to requeue orphaned leases
+    processing = await redis_client.hgetall("tasks:processing")
+    for t_id, entry_json in processing.items():
+        try:
+            entry = json.loads(entry_json)
+            # Support both new wrapper format and legacy raw format
+            if "leased_at" in entry and "payload" in entry:
+                node_id = entry.get("node_id")
+                leased_at = entry.get("leased_at", 0)
+                payload = entry.get("payload")
+                
+                # Orphan condition: Node is dead OR lease is older than 15s
+                if node_id in dead_nodes or (now - float(leased_at) > 15):
+                    print(f"[Scheduler] Requeuing orphaned task {t_id} from node {node_id}")
+                    await redis_client.hdel("tasks:processing", t_id)
+                    # Requeue at the front of the line
+                    await redis_client.lpush("tasks:pending", json.dumps(payload))
+            else:
+                # It's an old task without a lease wrapper, just ignore or eventually clean it up
+                pass
+        except Exception as e:
+            print(f"[Scheduler] Error processing lease for {t_id}: {e}")
 
 async def session_monitor_task(ctx):
     """
@@ -88,6 +116,134 @@ async def session_monitor_task(ctx):
         next_tick = now + interval
         await redis_client.zadd("active_session_ticks", {session_id: next_tick})
 
+async def master_relayer_task(ctx):
+    """
+    Sequentially processes completed tasks from tasks:settlement queue.
+    Ensures safe nonce handling by doing one by one.
+    """
+    redis_client: redis.Redis = ctx['redis']
+    
+    if await redis_client.llen("tasks:settlement") == 0:
+        return
+        
+    RELAYER_PRIVATE_KEY = os.environ.get("RELAYER_PRIVATE_KEY")
+    if not RELAYER_PRIVATE_KEY:
+        print("[Relayer] No RELAYER_PRIVATE_KEY configured.")
+        return
+        
+    try:
+        from web3.middleware import ExtraDataToPOAMiddleware as poa_middleware
+    except ImportError:
+        try:
+            from web3.middleware import geth_poa_middleware as poa_middleware
+        except ImportError:
+            poa_middleware = None
+            
+    w3 = Web3(Web3.HTTPProvider("https://rpc.bohr.life"))
+    if poa_middleware:
+        w3.middleware_onion.inject(poa_middleware, layer=0)
+        
+    relayer_account = Account.from_key(RELAYER_PRIVATE_KEY)
+    
+    ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
+    ATMA_TOKEN_ADDRESS = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
+    
+    ESCROW_ABI = [
+        {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "address", "name": "subAgent", "type": "address"}, {"internalType": "address", "name": "computeNode", "type": "address"}], "name": "settleTask", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+        {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "uint256", "name": "amount", "type": "uint256"}], "name": "depositIntent", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
+    ]
+    
+    ERC20_ABI = [
+        {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"}
+    ]
+    
+    contract = w3.eth.contract(address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI)
+    atma_contract = w3.eth.contract(address=w3.to_checksum_address(ATMA_TOKEN_ADDRESS), abi=ERC20_ABI)
+    
+    while True:
+        task_json = await redis_client.lpop("tasks:settlement")
+        if not task_json:
+            break
+            
+        payload = json.loads(task_json)
+        t_id = payload["task_id"]
+        sub_agent = payload["sub_agent"]
+        operator_vault = payload["operator_vault"]
+        
+        try:
+            print(f"[Relayer] Processing settlement for {t_id}")
+            task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
+            sub_agent_addr = w3.to_checksum_address(sub_agent)
+            vault_addr = w3.to_checksum_address(operator_vault)
+            amount = w3.to_wei(10, 'ether')
+            
+            nonce = w3.eth.get_transaction_count(relayer_account.address, 'pending')
+            
+            # 1. Approve
+            approve_tx = atma_contract.functions.approve(
+                w3.to_checksum_address(ESCROW_ADDRESS), amount
+            ).build_transaction({
+                'from': relayer_account.address,
+                'nonce': nonce,
+                'chainId': 968,
+                'gas': 100000,
+                'gasPrice': w3.eth.gas_price
+            })
+            signed_app = w3.eth.account.sign_transaction(approve_tx, private_key=RELAYER_PRIVATE_KEY)
+            w3.eth.send_raw_transaction(signed_app.raw_transaction)
+
+            # 2. Deposit
+            dep_tx = contract.functions.depositIntent(
+                task_id_bytes, amount
+            ).build_transaction({
+                'from': relayer_account.address,
+                'nonce': nonce + 1,
+                'chainId': 968,
+                'gas': 500000,
+                'gasPrice': w3.eth.gas_price
+            })
+            signed_dep = w3.eth.account.sign_transaction(dep_tx, private_key=RELAYER_PRIVATE_KEY)
+            w3.eth.send_raw_transaction(signed_dep.raw_transaction)
+
+            # 3. Settle
+            tx_dict = contract.functions.settleTask(
+                task_id_bytes, sub_agent_addr, vault_addr
+            ).build_transaction({
+                "from": relayer_account.address,
+                "nonce": nonce + 2,
+                "chainId": 968,
+                "gas": 1500000,
+                "gasPrice": w3.eth.gas_price,
+            })
+
+            signed_tx = w3.eth.account.sign_transaction(tx_dict, private_key=RELAYER_PRIVATE_KEY)
+            tx_hash_bytes = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash = w3.to_hex(tx_hash_bytes)
+
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash_bytes, timeout=30)
+            if receipt.status != 1:
+                raise RuntimeError(f"Settlement reverted: {tx_hash}")
+                
+            print(f"[Relayer] ✅ Settled {t_id} — tx: {tx_hash}")
+            
+            # Update the completed task hash with the tx_hash
+            completed_json = await redis_client.hget("tasks:completed", t_id)
+            if completed_json:
+                completed_data = json.loads(completed_json)
+                completed_data["settlement_tx_hash"] = tx_hash
+                await redis_client.hset("tasks:completed", t_id, json.dumps(completed_data))
+                
+        except Exception as e:
+            error = f"Relayer settlement failed: {str(e)}"
+            print(f"[Relayer] ❌ {error} for task {t_id}")
+            
+            # Update error in DB
+            completed_json = await redis_client.hget("tasks:completed", t_id)
+            if completed_json:
+                completed_data = json.loads(completed_json)
+                completed_data["error"] = error
+                await redis_client.hset("tasks:completed", t_id, json.dumps(completed_data))
+
 async def startup(ctx):
     ctx['redis'] = await get_redis_pool()
     print("[Scheduler] ARQ Worker Started.")
@@ -100,7 +256,8 @@ class WorkerSettings:
     functions = []
     cron_jobs = [
         cron(watchdog_task, second=set(range(0, 60, 2))),  # run every 2s
-        cron(session_monitor_task, second=set(range(0, 60, 2))) # run every 2s
+        cron(session_monitor_task, second=set(range(0, 60, 2))), # run every 2s
+        cron(master_relayer_task, second=set(range(0, 60, 2))) # run every 2s
     ]
     on_startup = startup
     on_shutdown = shutdown
