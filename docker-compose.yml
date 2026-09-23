@@ -57,3 +57,4 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.autonome:/root/.autonome
     restart: unless-stopped
+    profiles: ["manual"]

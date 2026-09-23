@@ -143,7 +143,6 @@ class CompleteTaskRequest(BaseModel):
     signature: str
     sub_agent: str
     node_address: str = Field(..., min_length=42, max_length=42, pattern=r'^0x[a-fA-F0-9]{40}$')
-    operator_vault: str = ""
 
 class OrchestrateRequest(BaseModel):
     prompt: str
@@ -182,10 +181,11 @@ async def enqueue_task(manifest: TaskManifest):
 async def node_heartbeat(req: HeartbeatRequest):
     now = time.time()
     await redis_client.hset("active_workers", req.node_id, now)
+    await redis_client.sadd("active_depin_nodes", req.node_id)
     await redis_client.set(f"worker_hw:{req.node_id}", json.dumps(req.hardware))
     await redis_client.set(f"worker_acus:{req.node_id}", req.max_acus)
     if req.operator_vault:
-        await redis_client.set(f"worker_vault:{req.node_id}", req.operator_vault)
+        await redis_client.setex(f"node_vault:{req.node_id}", 86400, req.operator_vault)
     
     # Try to pop a task
     task_json = await redis_client.lpop("tasks:pending")
@@ -318,7 +318,13 @@ async def complete_task(req: CompleteTaskRequest):
     node_addr = req.node_address
     
     if node_addr and node_addr != "0x0000000000000000000000000000000000000000":
-        contributor_data = json.dumps({"node": node_addr, "vault": req.operator_vault})
+        # Read the operator vault directly from Redis registry
+        vault = await redis_client.get(f"node_vault:{node_addr}")
+        if not vault:
+            print(f"[Orchestrator] Missing vault in registry for node {node_addr}. Flagging for relayer fallback.")
+            vault = ""
+            
+        contributor_data = json.dumps({"node": node_addr, "vault": vault})
         await redis_client.rpush(f"tasks:{t_id}:contributors", contributor_data)
         
     # Compile and deduplicate the list of unique contributor nodes
@@ -478,7 +484,7 @@ async def admin_get_nodes():
     workers = await redis_client.hgetall("active_workers")
     nodes = []
     for node_id, last_beat in workers.items():
-        vault = await redis_client.get(f"worker_vault:{node_id}") or ""
+        vault = await redis_client.get(f"node_vault:{node_id}") or ""
         hw_raw = await redis_client.get(f"worker_hw:{node_id}")
         acu_raw = await redis_client.get(f"worker_acus:{node_id}")
         hw = json.loads(hw_raw) if hw_raw else {}

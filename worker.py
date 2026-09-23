@@ -174,8 +174,7 @@ def execute_docker_sandbox(manifest: dict):
             proof_hash=proof_hash,
             signature="",
             sub_agent=manifest.get("sub_agent", ""),
-            node_address=node_address,
-            operator_vault=CURRENT_VAULT
+            node_address=node_address
         )
 
     except HTTPException:
@@ -234,7 +233,6 @@ async def execute_and_report(task: dict):
                 "signature":        "",
                 "sub_agent":        task.get("sub_agent", ""),
                 "node_address":     node_address,
-                "operator_vault":   CURRENT_VAULT,
             }
             requests.post(f"{orchestrator_url}/tasks/complete", json=error_payload, timeout=10)
         except Exception:
