@@ -180,7 +180,6 @@ async def enqueue_task(manifest: TaskManifest):
 async def node_heartbeat(req: HeartbeatRequest):
     now = time.time()
     await redis_client.hset("active_workers", req.node_id, now)
-    await redis_client.set(f"worker_vault:{req.node_id}", req.vault)
     await redis_client.set(f"worker_hw:{req.node_id}", json.dumps(req.hardware))
     await redis_client.set(f"worker_acus:{req.node_id}", req.max_acus)
     
@@ -188,9 +187,6 @@ async def node_heartbeat(req: HeartbeatRequest):
     task_json = await redis_client.lpop("tasks:pending")
     if task_json:
         task_data = json.loads(task_json)
-        # Inherit node vault if task vault is empty or zero
-        if not task_data.get("operator_vault") or task_data["operator_vault"] == "0x0000000000000000000000000000000000000000":
-            task_data["operator_vault"] = req.vault
         
         # Keep track of processing tasks with lease info
         processing_entry = {
