@@ -6,6 +6,10 @@ from arq import cron
 import redis.asyncio as redis
 from web3 import Web3
 from eth_account import Account
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
@@ -188,15 +192,16 @@ async def master_relayer_task(ctx):
             
             for node in compute_nodes:
                 if node and node != "0x0000000000000000000000000000000000000000":
-                    c_node = w3.to_checksum_address(node)
-                    node_addrs.append(c_node)
+                    checksummed_node = w3.to_checksum_address(node)
+                    node_addrs.append(checksummed_node)
                     
                     try:
-                        derived_vault = factory_contract.functions.getAddress(c_node, 0).call()
+                        derived_vault = factory_contract.functions.getAddress(checksummed_node, 0).call()
                         vault_addrs.append(w3.to_checksum_address(derived_vault))
-                        print(f"[Relayer] Derived Vault {derived_vault} for Node {c_node}")
+                        print(f"[Relayer] Derived Vault {derived_vault} for Node {checksummed_node}")
                     except Exception as e:
-                        print(f"[Relayer] Failed to derive vault for node {c_node} on task {t_id}: {e}. Substituting relayer address.")
+                        logger.error(f"Vault derivation failed for {checksummed_node}: {e}")
+                        print(f"[Relayer] Failed to derive vault for node {checksummed_node} on task {t_id}: {e}. Substituting relayer address.")
                         vault_addrs.append(relayer_account.address)
             
             if not node_addrs:
