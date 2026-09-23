@@ -4,7 +4,7 @@ from botchain.client import BotChain
 from botchain.dex_alm import ALMManager
 from botchain.dex import BDexManager
 
-ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
+ESCROW_ADDRESS = "0xF54eA7205dc77C02FdCf86c4707f7cF7BDB3C372"
 ATMA_TOKEN = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
 
 def load_abi(filename):

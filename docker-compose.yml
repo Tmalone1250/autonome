@@ -53,6 +53,7 @@ services:
       - .env
     environment:
       - ORCHESTRATOR_URL=http://autonome-orchestrator:8001
+      - OPERATOR_VAULT=${OPERATOR_VAULT}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.autonome:/root/.autonome

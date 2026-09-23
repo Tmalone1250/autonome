@@ -145,11 +145,11 @@ async def master_relayer_task(ctx):
         
     relayer_account = Account.from_key(RELAYER_PRIVATE_KEY)
     
-    ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
+    ESCROW_ADDRESS = "0xF54eA7205dc77C02FdCf86c4707f7cF7BDB3C372"
     ATMA_TOKEN_ADDRESS = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
     
     ESCROW_ABI = [
-        {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "address", "name": "subAgent", "type": "address"}, {"internalType": "address", "name": "computeNode", "type": "address"}], "name": "settleTask", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+        {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "address", "name": "subAgent", "type": "address"}, {"internalType": "address[]", "name": "computeNodes", "type": "address[]"}], "name": "settleTask", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
         {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "uint256", "name": "amount", "type": "uint256"}], "name": "depositIntent", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
     ]
     
@@ -168,13 +168,25 @@ async def master_relayer_task(ctx):
         payload = json.loads(task_json)
         t_id = payload["task_id"]
         sub_agent = payload["sub_agent"]
-        operator_vault = payload["operator_vault"]
+        operator_vaults = payload.get("operator_vaults", [])
+        
+        # Fallback for legacy payload if only operator_vault is present
+        if not operator_vaults and "operator_vault" in payload:
+            operator_vaults = [payload["operator_vault"]]
         
         try:
             print(f"[Relayer] Processing settlement for {t_id}", flush=True)
             task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
             sub_agent_addr = w3.to_checksum_address(sub_agent) if sub_agent else w3.to_checksum_address("0x0000000000000000000000000000000000000000")
-            vault_addr = w3.to_checksum_address(operator_vault) if operator_vault else w3.to_checksum_address("0x0000000000000000000000000000000000000000")
+            
+            vault_addrs = []
+            for vault in operator_vaults:
+                if vault and vault != "0x0000000000000000000000000000000000000000":
+                    vault_addrs.append(w3.to_checksum_address(vault))
+            
+            if not vault_addrs:
+                # Add a dummy zero address to fail cleanly if no valid vault is found
+                vault_addrs = [w3.to_checksum_address("0x0000000000000000000000000000000000000000")]
             amount = w3.to_wei(10, 'ether')
             
             nonce = w3.eth.get_transaction_count(relayer_account.address, 'pending')
@@ -207,7 +219,7 @@ async def master_relayer_task(ctx):
 
             # 3. Settle
             tx_dict = contract.functions.settleTask(
-                task_id_bytes, sub_agent_addr, vault_addr
+                task_id_bytes, sub_agent_addr, vault_addrs
             ).build_transaction({
                 "from": relayer_account.address,
                 "nonce": nonce + 2,

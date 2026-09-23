@@ -24,7 +24,7 @@ Account.enable_unaudited_hdwallet_features()
 
 START_TIME = time.time()
 DB_PATH = os.path.expanduser("~/.autonome/execution_logs.db")
-ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
+ESCROW_ADDRESS = "0xF54eA7205dc77C02FdCf86c4707f7cF7BDB3C372"
 
 def get_or_create_node_key() -> str:
     key_dir = Path.home() / ".autonome"
@@ -176,7 +176,8 @@ def execute_docker_sandbox(manifest: dict):
             proof_hash=proof_hash,
             signature=signature,
             sub_agent=manifest.get("sub_agent", ""),
-            operator_vault=actual_vault
+            operator_vault=actual_vault,
+            operator_vaults=[actual_vault] if actual_vault else []
         )
 
     except HTTPException:
@@ -234,6 +235,7 @@ async def execute_and_report(task: dict):
                 "signature":        "",
                 "sub_agent":        task.get("sub_agent", ""),
                 "operator_vault":   task.get("operator_vault", ""),
+                "operator_vaults":  [task.get("operator_vault", "")] if task.get("operator_vault") else [],
             }
             requests.post(f"{orchestrator_url}/tasks/complete", json=error_payload, timeout=10)
         except Exception:

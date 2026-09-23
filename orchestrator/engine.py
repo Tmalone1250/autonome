@@ -57,7 +57,7 @@ if RELAYER_PRIVATE_KEY:
 else:
     relayer_account = None
 
-ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
+ESCROW_ADDRESS = "0xF54eA7205dc77C02FdCf86c4707f7cF7BDB3C372"
 ATMA_TOKEN_ADDRESS = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
 
 ESCROW_ABI = [
@@ -143,7 +143,8 @@ class CompleteTaskRequest(BaseModel):
     proof_hash: str
     signature: str
     sub_agent: str
-    operator_vault: str
+    operator_vault: str = ""
+    operator_vaults: list[str] = []
 
 class OrchestrateRequest(BaseModel):
     prompt: str
@@ -271,10 +272,16 @@ async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""
             pass
 
 async def _process_legacy_completion(req, t_id, sub_agent, operator_vault):
+    if operator_vault and operator_vault != "0x0000000000000000000000000000000000000000":
+        await redis_client.sadd(f"tasks:{t_id}:vaults", operator_vault)
+        
+    vaults_bytes = await redis_client.smembers(f"tasks:{t_id}:vaults")
+    operator_vaults = [v.decode("utf-8") for v in vaults_bytes] if vaults_bytes else []
+    
     settlement_payload = {
         "task_id": t_id,
         "sub_agent": sub_agent,
-        "operator_vault": operator_vault
+        "operator_vaults": operator_vaults
     }
     await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     
@@ -296,11 +303,24 @@ async def complete_task(req: CompleteTaskRequest):
     # Check if this is a session tick
     is_session_tick = "-tick-" in t_id
     
+    # Store the vault in the task's contributor set
+    if req.operator_vault and req.operator_vault != "0x0000000000000000000000000000000000000000":
+        await redis_client.sadd(f"tasks:{t_id}:vaults", req.operator_vault)
+    
+    if req.operator_vaults:
+        for vault in req.operator_vaults:
+            if vault and vault != "0x0000000000000000000000000000000000000000":
+                await redis_client.sadd(f"tasks:{t_id}:vaults", vault)
+        
+    # Compile and deduplicate the list of unique operator vaults
+    vaults_bytes = await redis_client.smembers(f"tasks:{t_id}:vaults")
+    operator_vaults = [v.decode("utf-8") for v in vaults_bytes] if vaults_bytes else []
+    
     # Push to Master Relayer queue
     settlement_payload = {
         "task_id": t_id,
         "sub_agent": req.sub_agent,
-        "operator_vault": req.operator_vault
+        "operator_vaults": operator_vaults
     }
     await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     

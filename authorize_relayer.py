@@ -19,7 +19,7 @@ relayer_account = Account.from_key(RELAYER_PRIVATE_KEY)
 print(f"Deployer address: {deployer_account.address}")
 print(f"Relayer address: {relayer_account.address}")
 
-ESCROW_ADDRESS = "0x5b30dB9F00F9fa644a13117D5b31844223e3Fb4E"
+ESCROW_ADDRESS = "0xF54eA7205dc77C02FdCf86c4707f7cF7BDB3C372"
 ESCROW_ABI = [{
     "inputs": [{"internalType": "address", "name": "_validator", "type": "address"}],
     "name": "setValidator",
