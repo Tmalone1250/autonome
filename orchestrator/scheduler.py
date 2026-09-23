@@ -149,11 +149,11 @@ async def master_relayer_task(ctx):
         
     relayer_account = Account.from_key(RELAYER_PRIVATE_KEY)
     
-    ESCROW_ADDRESS = "0xA3F9009a755a468Ca5cf99Bc389372C5B3A8D90F"
+    ESCROW_ADDRESS = "0x2c2AeD6719aF5F962b5e222094A0492E0AE0b82e"
     ATMA_TOKEN_ADDRESS = "0xd29dE89D308b3F1eAcF3c36f821842F8F6f3f840"
     
     ESCROW_ABI = [
-        {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "address", "name": "subAgentVault", "type": "address"}, {"internalType": "address[]", "name": "computeNodes", "type": "address[]"}, {"internalType": "address[]", "name": "operatorVaults", "type": "address[]"}], "name": "settleTask", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+        {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "address", "name": "subAgentVault", "type": "address"}, {"internalType": "address[]", "name": "computeNodes", "type": "address[]"}], "name": "settleTask", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
         {"inputs": [{"internalType": "bytes32", "name": "taskId", "type": "bytes32"}, {"internalType": "uint256", "name": "amount", "type": "uint256"}], "name": "depositIntent", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
     ]
     
@@ -182,7 +182,6 @@ async def master_relayer_task(ctx):
             sub_agent_addr = w3.to_checksum_address(sub_agent) if sub_agent else w3.to_checksum_address("0x0000000000000000000000000000000000000000")
             
             node_addrs = []
-            vault_addrs = []
             
             for i, node in enumerate(compute_nodes):
                 if node and node != "0x0000000000000000000000000000000000000000":
@@ -192,24 +191,12 @@ async def master_relayer_task(ctx):
                     except Exception as e:
                         print(f"[Relayer] Invalid node address at index {i}: {node}. Skipping.")
                         continue
-                    
-                    vault = operator_vaults[i] if i < len(operator_vaults) else None
-                    if vault and vault != "0x0000000000000000000000000000000000000000":
-                        try:
-                            vault_addrs.append(w3.to_checksum_address(vault))
-                        except Exception as e:
-                            logger.error(f"Invalid operator vault '{vault}' for node {checksummed_node}: {e}. Substituting relayer address.")
-                            vault_addrs.append(relayer_account.address)
-                    else:
-                        print(f"[Relayer] Missing operator vault for node {checksummed_node}. Substituting relayer address.")
-                        vault_addrs.append(relayer_account.address)
             
             if not node_addrs:
                 # Fallback if no valid compute nodes
                 print(f"[Relayer] No valid compute nodes provided for task {t_id}. Falling back to relayer address.")
                 logger.warning(f"Fallback active for task {t_id}: 15% of ATMA rewards will bypass DePIN operators.")
                 node_addrs = [relayer_account.address]
-                vault_addrs = [relayer_account.address]
                 
             amount = w3.to_wei(10, 'ether')
             
@@ -243,7 +230,7 @@ async def master_relayer_task(ctx):
 
             # 3. Settle
             tx_dict = contract.functions.settleTask(
-                task_id_bytes, sub_agent_addr, node_addrs, vault_addrs
+                task_id_bytes, sub_agent_addr, node_addrs
             ).build_transaction({
                 "from": relayer_account.address,
                 "nonce": nonce + 2,

@@ -104,8 +104,6 @@ class WorkloadManifest(BaseModel):
 class VaultRequest(BaseModel):
     vault: str
 
-CURRENT_VAULT = ""
-
 class TaskResponse(BaseModel):
     task_id: str
     inference_result: str
@@ -254,8 +252,7 @@ async def http_polling_loop():
             payload = {
                 "node_id": node_address,
                 "hardware": hw,
-                "max_acus": GLOBAL_ACU_SCORE,
-                "operator_vault": CURRENT_VAULT
+                "max_acus": GLOBAL_ACU_SCORE
             }
             
             resp = requests.post(f"{orchestrator_url}/nodes/heartbeat", json=payload, timeout=5)
@@ -316,6 +313,12 @@ async def http_polling_loop():
 
 @app.on_event("startup")
 async def startup_event():
+    node_address = Account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
+    print("\n" + "="*70)
+    print(f"[ACTION REQUIRED] Register this Node Address in your Dashboard:")
+    print(f" -> {node_address}")
+    print("="*70 + "\n")
+    
     # Run the CPU-locking benchmark in a thread pool to avoid freezing the event loop completely
     await asyncio.get_event_loop().run_in_executor(None, run_acu_benchmark)
     asyncio.create_task(http_polling_loop())
@@ -356,12 +359,6 @@ def update_log(task_id: str, update: LogUpdate):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update log: {str(e)}")
-
-@app.post("/set_vault")
-def set_vault(request: VaultRequest):
-    global CURRENT_VAULT
-    CURRENT_VAULT = request.vault
-    return {"status": "success", "vault": CURRENT_VAULT}
 
 @app.get("/status")
 def get_node_status():

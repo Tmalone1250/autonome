@@ -154,7 +154,6 @@ class HeartbeatRequest(BaseModel):
     node_id: str
     hardware: dict
     max_acus: int = 0
-    operator_vault: str = ""
 
 class CreateSessionRequest(BaseModel):
     agent: str
@@ -185,8 +184,6 @@ async def node_heartbeat(req: HeartbeatRequest):
     await redis_client.sadd("active_depin_nodes", req.node_id)
     await redis_client.set(f"worker_hw:{req.node_id}", json.dumps(req.hardware))
     await redis_client.set(f"worker_acus:{req.node_id}", req.max_acus)
-    if req.operator_vault:
-        await redis_client.setex(f"node_vault:{req.node_id}", 86400, req.operator_vault)
     
     # Try to pop a task
     task_json = await redis_client.lpop("tasks:pending")
@@ -251,9 +248,8 @@ async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""
                     if "task_id" in result_data and "inference_result" in result_data:
                         t_id = result_data["task_id"]
                         sub_agent = result_data.get("sub_agent", "")
-                        operator_vault = result_data.get("operator_vault", vault)
                         node_addr = result_data.get("node_address", node)
-                        asyncio.create_task(_process_legacy_completion(result_data, t_id, sub_agent, operator_vault, node_addr))
+                        asyncio.create_task(_process_legacy_completion(result_data, t_id, sub_agent, node_addr))
                 except json.JSONDecodeError:
                     pass
             except asyncio.TimeoutError:
@@ -268,26 +264,29 @@ async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""
         except:
             pass
 
-async def _process_legacy_completion(req, t_id, sub_agent, operator_vault, node_addr):
-    if node_addr and operator_vault and operator_vault != "0x0000000000000000000000000000000000000000":
-        contributor = {"node": node_addr, "vault": operator_vault}
-        await redis_client.rpush(f"tasks:{t_id}:contributors", json.dumps(contributor))
+async def _process_legacy_completion(req, t_id, sub_agent, node_addr):
+    if node_addr and node_addr != "0x0000000000000000000000000000000000000000":
+        await redis_client.rpush(f"tasks:{t_id}:contributors", node_addr)
         
     contributors_bytes = await redis_client.lrange(f"tasks:{t_id}:contributors", 0, -1)
     
     seen = set()
     compute_nodes = []
-    operator_vaults = []
     
     for b in contributors_bytes:
         try:
-            c = json.loads(b.decode("utf-8"))
-            pair = (c["node"], c["vault"])
-            if pair not in seen:
-                seen.add(pair)
-                compute_nodes.append(c["node"])
-                operator_vaults.append(c["vault"])
-        except:
+            node_str = b.decode("utf-8")
+            if node_str.startswith("{"):
+                # Handle legacy JSON payloads
+                c = json.loads(node_str)
+                node = c.get("node")
+            else:
+                node = node_str
+                
+            if node and node not in seen:
+                seen.add(node)
+                compute_nodes.append(node)
+        except Exception:
             pass
     
     settlement_payload = {
@@ -319,38 +318,27 @@ async def complete_task(req: CompleteTaskRequest):
     node_addr = req.node_address
     
     if node_addr and node_addr != "0x0000000000000000000000000000000000000000":
-        # Read the operator vault directly from Redis registry
-        vault = await redis_client.get(f"node_vault:{node_addr}")
-        if not vault:
-            print(f"[Orchestrator] Missing vault in registry for node {node_addr}. Flagging for relayer fallback.")
-            vault = ""
-            
-        contributor_data = json.dumps({"node": node_addr, "vault": vault})
-        await redis_client.rpush(f"tasks:{t_id}:contributors", contributor_data)
+        await redis_client.rpush(f"tasks:{t_id}:contributors", node_addr)
         
     # Compile and deduplicate the list of unique contributor nodes
     contributors_bytes = await redis_client.lrange(f"tasks:{t_id}:contributors", 0, -1)
     
     seen = set()
     compute_nodes = []
-    operator_vaults = []
     
     for b in contributors_bytes:
         try:
             item_str = b.decode("utf-8") if isinstance(b, bytes) else str(b)
             if item_str.startswith("{"):
+                # Handle legacy JSON payloads smoothly
                 item = json.loads(item_str)
                 node = item.get("node")
-                vault = item.get("vault", "")
             else:
                 node = item_str
-                vault = ""
             
-            pair = (node, vault)
-            if pair not in seen:
-                seen.add(pair)
+            if node and node not in seen:
+                seen.add(node)
                 compute_nodes.append(node)
-                operator_vaults.append(vault)
         except Exception as e:
             print(f"Error parsing contributor: {e}")
     
@@ -358,8 +346,7 @@ async def complete_task(req: CompleteTaskRequest):
     settlement_payload = {
         "task_id": t_id,
         "sub_agent": req.sub_agent,
-        "compute_nodes": compute_nodes,
-        "operator_vaults": operator_vaults
+        "compute_nodes": compute_nodes
     }
     await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     
