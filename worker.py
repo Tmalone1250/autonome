@@ -122,7 +122,6 @@ def execute_docker_sandbox(manifest: dict):
 
         # Vault is resolved dynamically by Relayer
         print(f"[Worker] Executing task {manifest.get('task_id', '')}")
-        print(f"[Worker] Operator Vault resolved to: {actual_vault}")
 
         # 1. Ephemeral Docker Execution
         try:
