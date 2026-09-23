@@ -174,7 +174,8 @@ def execute_docker_sandbox(manifest: dict):
             proof_hash=proof_hash,
             signature="",
             sub_agent=manifest.get("sub_agent", ""),
-            node_address=node_address
+            node_address=node_address,
+            operator_vault=CURRENT_VAULT
         )
 
     except HTTPException:
@@ -233,6 +234,7 @@ async def execute_and_report(task: dict):
                 "signature":        "",
                 "sub_agent":        task.get("sub_agent", ""),
                 "node_address":     node_address,
+                "operator_vault":   CURRENT_VAULT,
             }
             requests.post(f"{orchestrator_url}/tasks/complete", json=error_payload, timeout=10)
         except Exception:
@@ -254,7 +256,8 @@ async def http_polling_loop():
             payload = {
                 "node_id": node_address,
                 "hardware": hw,
-                "max_acus": GLOBAL_ACU_SCORE
+                "max_acus": GLOBAL_ACU_SCORE,
+                "operator_vault": CURRENT_VAULT
             }
             
             resp = requests.post(f"{orchestrator_url}/nodes/heartbeat", json=payload, timeout=5)

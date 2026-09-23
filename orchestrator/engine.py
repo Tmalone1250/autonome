@@ -143,6 +143,7 @@ class CompleteTaskRequest(BaseModel):
     signature: str
     sub_agent: str
     node_address: str = Field(..., min_length=42, max_length=42, pattern=r'^0x[a-fA-F0-9]{40}$')
+    operator_vault: str = ""
 
 class OrchestrateRequest(BaseModel):
     prompt: str
@@ -153,6 +154,7 @@ class HeartbeatRequest(BaseModel):
     node_id: str
     hardware: dict
     max_acus: int = 0
+    operator_vault: str = ""
 
 class CreateSessionRequest(BaseModel):
     agent: str
@@ -182,6 +184,8 @@ async def node_heartbeat(req: HeartbeatRequest):
     await redis_client.hset("active_workers", req.node_id, now)
     await redis_client.set(f"worker_hw:{req.node_id}", json.dumps(req.hardware))
     await redis_client.set(f"worker_acus:{req.node_id}", req.max_acus)
+    if req.operator_vault:
+        await redis_client.set(f"worker_vault:{req.node_id}", req.operator_vault)
     
     # Try to pop a task
     task_json = await redis_client.lpop("tasks:pending")
@@ -314,20 +318,32 @@ async def complete_task(req: CompleteTaskRequest):
     node_addr = req.node_address
     
     if node_addr and node_addr != "0x0000000000000000000000000000000000000000":
-        await redis_client.rpush(f"tasks:{t_id}:contributors", node_addr)
+        contributor_data = json.dumps({"node": node_addr, "vault": req.operator_vault})
+        await redis_client.rpush(f"tasks:{t_id}:contributors", contributor_data)
         
     # Compile and deduplicate the list of unique contributor nodes
     contributors_bytes = await redis_client.lrange(f"tasks:{t_id}:contributors", 0, -1)
     
     seen = set()
     compute_nodes = []
+    operator_vaults = []
     
     for b in contributors_bytes:
         try:
-            node = b.decode("utf-8") if isinstance(b, bytes) else str(b)
-            if node not in seen:
-                seen.add(node)
+            item_str = b.decode("utf-8") if isinstance(b, bytes) else str(b)
+            if item_str.startswith("{"):
+                item = json.loads(item_str)
+                node = item.get("node")
+                vault = item.get("vault", "")
+            else:
+                node = item_str
+                vault = ""
+            
+            pair = (node, vault)
+            if pair not in seen:
+                seen.add(pair)
                 compute_nodes.append(node)
+                operator_vaults.append(vault)
         except Exception as e:
             print(f"Error parsing contributor: {e}")
     
@@ -335,7 +351,8 @@ async def complete_task(req: CompleteTaskRequest):
     settlement_payload = {
         "task_id": t_id,
         "sub_agent": req.sub_agent,
-        "compute_nodes": compute_nodes
+        "compute_nodes": compute_nodes,
+        "operator_vaults": operator_vaults
     }
     await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     

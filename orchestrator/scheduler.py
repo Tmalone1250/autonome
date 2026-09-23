@@ -164,12 +164,7 @@ async def master_relayer_task(ctx):
     contract = w3.eth.contract(address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI)
     atma_contract = w3.eth.contract(address=w3.to_checksum_address(ATMA_TOKEN_ADDRESS), abi=ERC20_ABI)
     
-    SIMPLE_ACCOUNT_FACTORY = "0xBC88d6012b3bf8426C2851d3798cEB5257658332"
-    FACTORY_ABI = [
-        {"inputs": [{"internalType": "address", "name": "owner", "type": "address"}, {"internalType": "uint256", "name": "salt", "type": "uint256"}], "name": "getAddress", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "view", "type": "function"}
-    ]
-    factory_contract = w3.eth.contract(address=w3.to_checksum_address(SIMPLE_ACCOUNT_FACTORY), abi=FACTORY_ABI)
-    
+
     while True:
         task_json = await redis_client.lpop("tasks:settlement")
         if not task_json:
@@ -179,9 +174,8 @@ async def master_relayer_task(ctx):
         t_id = payload["task_id"]
         sub_agent = payload["sub_agent"]
         compute_nodes = payload.get("compute_nodes", [])
+        operator_vaults = payload.get("operator_vaults", [])
         
-        # We ignore operator_vaults from the payload and compute it dynamically
-            
         try:
             print(f"[Relayer] Processing settlement for {t_id}", flush=True)
             task_id_bytes = w3.to_bytes(hexstr=t_id) if t_id.startswith("0x") else w3.keccak(text=t_id)
@@ -190,18 +184,24 @@ async def master_relayer_task(ctx):
             node_addrs = []
             vault_addrs = []
             
-            for node in compute_nodes:
+            for i, node in enumerate(compute_nodes):
                 if node and node != "0x0000000000000000000000000000000000000000":
-                    checksummed_node = w3.to_checksum_address(node)
-                    node_addrs.append(checksummed_node)
-                    
                     try:
-                        derived_vault = factory_contract.functions.getAddress(checksummed_node, 0).call()
-                        vault_addrs.append(w3.to_checksum_address(derived_vault))
-                        print(f"[Relayer] Derived Vault {derived_vault} for Node {checksummed_node}")
+                        checksummed_node = w3.to_checksum_address(node)
+                        node_addrs.append(checksummed_node)
                     except Exception as e:
-                        logger.error(f"Vault derivation failed for {checksummed_node}: {e}")
-                        print(f"[Relayer] Failed to derive vault for node {checksummed_node} on task {t_id}: {e}. Substituting relayer address.")
+                        print(f"[Relayer] Invalid node address at index {i}: {node}. Skipping.")
+                        continue
+                    
+                    vault = operator_vaults[i] if i < len(operator_vaults) else None
+                    if vault and vault != "0x0000000000000000000000000000000000000000":
+                        try:
+                            vault_addrs.append(w3.to_checksum_address(vault))
+                        except Exception as e:
+                            logger.error(f"Invalid operator vault '{vault}' for node {checksummed_node}: {e}. Substituting relayer address.")
+                            vault_addrs.append(relayer_account.address)
+                    else:
+                        print(f"[Relayer] Missing operator vault for node {checksummed_node}. Substituting relayer address.")
                         vault_addrs.append(relayer_account.address)
             
             if not node_addrs:
