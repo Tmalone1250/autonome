@@ -170,12 +170,14 @@ def execute_docker_sandbox(manifest: dict):
         except Exception as e:
             print(f"[Worker] Warning: Error persisting logs: {e}")
 
+        node_address = Account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
         return dict(
             task_id=manifest["task_id"],
             inference_result=output_str,
             proof_hash=proof_hash,
             signature=signature,
             sub_agent=manifest.get("sub_agent", ""),
+            node_address=node_address,
             operator_vault=actual_vault,
             operator_vaults=[actual_vault] if actual_vault else []
         )
@@ -228,12 +230,14 @@ async def execute_and_report(task: dict):
         print(f"[Worker] execute_and_report error: {e}")
         # Send an error proof
         try:
+            node_address = Account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else ""
             error_payload = {
                 "task_id":          task.get("task_id", ""),
                 "inference_result": f"Error: {str(e)}",
                 "proof_hash":       "",
                 "signature":        "",
                 "sub_agent":        task.get("sub_agent", ""),
+                "node_address":     node_address,
                 "operator_vault":   task.get("operator_vault", ""),
                 "operator_vaults":  [task.get("operator_vault", "")] if task.get("operator_vault") else [],
             }
