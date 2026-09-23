@@ -207,6 +207,7 @@ async def master_relayer_task(ctx):
             if not node_addrs:
                 # Fallback if no valid compute nodes
                 print(f"[Relayer] No valid compute nodes provided for task {t_id}. Falling back to relayer address.")
+                logger.warning(f"Fallback active for task {t_id}: 15% of ATMA rewards will bypass DePIN operators.")
                 node_addrs = [relayer_account.address]
                 vault_addrs = [relayer_account.address]
                 

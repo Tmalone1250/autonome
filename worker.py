@@ -173,6 +173,8 @@ def execute_docker_sandbox(manifest: dict):
             task_id=manifest["task_id"],
             inference_result=output_str,
             proof_hash=proof_hash,
+            signature="",
+            sub_agent=manifest.get("sub_agent", ""),
             node_address=node_address
         )
 
