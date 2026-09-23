@@ -99,7 +99,6 @@ class WorkloadManifest(BaseModel):
     domain: str
     image: str
     env_vars: dict = {}
-    operator_vault: str
     sub_agent: str
 
 class VaultRequest(BaseModel):
@@ -113,7 +112,6 @@ class TaskResponse(BaseModel):
     proof_hash: str
     signature: str
     sub_agent: str
-    operator_vault: str
 
 def execute_docker_sandbox(manifest: dict):
     try:
@@ -122,7 +120,7 @@ def execute_docker_sandbox(manifest: dict):
         if not docker_client:
             raise HTTPException(status_code=500, detail="Docker client not initialized. Is the socket mounted?")
 
-        actual_vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT") or manifest.get("operator_vault", "")
+        # Vault is resolved dynamically by Relayer
         print(f"[Worker] Executing task {manifest.get('task_id', '')}")
         print(f"[Worker] Operator Vault resolved to: {actual_vault}")
 
@@ -175,11 +173,7 @@ def execute_docker_sandbox(manifest: dict):
             task_id=manifest["task_id"],
             inference_result=output_str,
             proof_hash=proof_hash,
-            signature=signature,
-            sub_agent=manifest.get("sub_agent", ""),
-            node_address=node_address,
-            operator_vault=actual_vault,
-            operator_vaults=[actual_vault] if actual_vault else []
+            node_address=node_address
         )
 
     except HTTPException:
@@ -238,8 +232,6 @@ async def execute_and_report(task: dict):
                 "signature":        "",
                 "sub_agent":        task.get("sub_agent", ""),
                 "node_address":     node_address,
-                "operator_vault":   task.get("operator_vault", ""),
-                "operator_vaults":  [task.get("operator_vault", "")] if task.get("operator_vault") else [],
             }
             requests.post(f"{orchestrator_url}/tasks/complete", json=error_payload, timeout=10)
         except Exception:
@@ -257,11 +249,9 @@ async def http_polling_loop():
     
     while True:
         try:
-            vault = CURRENT_VAULT or os.environ.get("OPERATOR_VAULT", "")
             hw = get_node_status().get("hardware", {})
             payload = {
                 "node_id": node_address,
-                "vault": vault,
                 "hardware": hw,
                 "max_acus": GLOBAL_ACU_SCORE
             }
@@ -391,7 +381,6 @@ def get_node_status():
         "status": "ONLINE" if docker_online else "DEGRADED",
         "uptime_seconds": int(time.time() - START_TIME),
         "node_address": Account.from_key(NODE_PRIVATE_KEY).address if NODE_PRIVATE_KEY else None,
-        "operator_vault_debug": CURRENT_VAULT or os.environ.get("OPERATOR_VAULT"),
         "hardware": {
             "cpu_usage_pct": cpu_percent,
             "ram_used_gb": round(ram.used / (1024 ** 3), 2),

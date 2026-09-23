@@ -160,6 +160,12 @@ async def master_relayer_task(ctx):
     contract = w3.eth.contract(address=w3.to_checksum_address(ESCROW_ADDRESS), abi=ESCROW_ABI)
     atma_contract = w3.eth.contract(address=w3.to_checksum_address(ATMA_TOKEN_ADDRESS), abi=ERC20_ABI)
     
+    SIMPLE_ACCOUNT_FACTORY = "0xBC88d6012b3bf8426C2851d3798cEB5257658332"
+    FACTORY_ABI = [
+        {"inputs": [{"internalType": "address", "name": "owner", "type": "address"}, {"internalType": "uint256", "name": "salt", "type": "uint256"}], "name": "getAddress", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "view", "type": "function"}
+    ]
+    factory_contract = w3.eth.contract(address=w3.to_checksum_address(SIMPLE_ACCOUNT_FACTORY), abi=FACTORY_ABI)
+    
     while True:
         task_json = await redis_client.lpop("tasks:settlement")
         if not task_json:
@@ -169,13 +175,8 @@ async def master_relayer_task(ctx):
         t_id = payload["task_id"]
         sub_agent = payload["sub_agent"]
         compute_nodes = payload.get("compute_nodes", [])
-        operator_vaults = payload.get("operator_vaults", [])
         
-        # Fallback for legacy payload if only operator_vault is present
-        if not operator_vaults and "operator_vault" in payload:
-            operator_vaults = [payload["operator_vault"]]
-        if not compute_nodes and "compute_nodes" not in payload:
-            compute_nodes = operator_vaults
+        # We ignore operator_vaults from the payload and compute it dynamically
             
         try:
             print(f"[Relayer] Processing settlement for {t_id}", flush=True)
@@ -185,15 +186,17 @@ async def master_relayer_task(ctx):
             node_addrs = []
             vault_addrs = []
             
-            for i, node in enumerate(compute_nodes):
+            for node in compute_nodes:
                 if node and node != "0x0000000000000000000000000000000000000000":
-                    node_addrs.append(w3.to_checksum_address(node))
+                    c_node = w3.to_checksum_address(node)
+                    node_addrs.append(c_node)
                     
-                    vault = operator_vaults[i] if i < len(operator_vaults) else None
-                    if vault and vault != "0x0000000000000000000000000000000000000000":
-                        vault_addrs.append(w3.to_checksum_address(vault))
-                    else:
-                        print(f"[Relayer] No valid operator vault provided for node {node} on task {t_id}. Substituting relayer address.")
+                    try:
+                        derived_vault = factory_contract.functions.getAddress(c_node, 0).call()
+                        vault_addrs.append(w3.to_checksum_address(derived_vault))
+                        print(f"[Relayer] Derived Vault {derived_vault} for Node {c_node}")
+                    except Exception as e:
+                        print(f"[Relayer] Failed to derive vault for node {c_node} on task {t_id}: {e}. Substituting relayer address.")
                         vault_addrs.append(relayer_account.address)
             
             if not node_addrs:

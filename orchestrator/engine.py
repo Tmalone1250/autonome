@@ -133,7 +133,6 @@ class TaskManifest(BaseModel):
     domain: str
     image: str
     env_vars: dict = {}
-    operator_vault: str
     sub_agent: str
     cost: float = 0.0
 
@@ -144,8 +143,6 @@ class CompleteTaskRequest(BaseModel):
     signature: str
     sub_agent: str
     node_address: str = ""
-    operator_vault: str = ""
-    operator_vaults: list[str] = []
 
 class OrchestrateRequest(BaseModel):
     prompt: str
@@ -154,7 +151,6 @@ class OrchestrateRequest(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     node_id: str
-    vault: str
     hardware: dict
     max_acus: int = 0
 
@@ -236,8 +232,6 @@ async def legacy_worker_ws(websocket: WebSocket, vault: str = "", node: str = ""
             task_json = await redis_client.lpop("tasks:pending")
             if task_json:
                 task_data = json.loads(task_json)
-                if not task_data.get("operator_vault") or task_data["operator_vault"] == "0x0000000000000000000000000000000000000000":
-                    task_data["operator_vault"] = vault
                 
                 processing_entry = {
                     "node_id": node,
@@ -298,8 +292,7 @@ async def _process_legacy_completion(req, t_id, sub_agent, operator_vault, node_
     settlement_payload = {
         "task_id": t_id,
         "sub_agent": sub_agent,
-        "compute_nodes": compute_nodes,
-        "operator_vaults": operator_vaults
+        "compute_nodes": compute_nodes
     }
     await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     
@@ -321,29 +314,24 @@ async def complete_task(req: CompleteTaskRequest):
     # Check if this is a session tick
     is_session_tick = "-tick-" in t_id
     
-    # Store the contributor pair in the task's contributor list
+    # Store the contributor node in the task's contributor list
     node_addr = req.node_address
-    vault_addr = req.operator_vault
     
-    if node_addr and vault_addr and vault_addr != "0x0000000000000000000000000000000000000000":
-        contributor = {"node": node_addr, "vault": vault_addr}
-        await redis_client.rpush(f"tasks:{t_id}:contributors", json.dumps(contributor))
+    if node_addr and node_addr != "0x0000000000000000000000000000000000000000":
+        await redis_client.rpush(f"tasks:{t_id}:contributors", node_addr)
         
-    # Compile and deduplicate the list of unique contributor pairs
+    # Compile and deduplicate the list of unique contributor nodes
     contributors_bytes = await redis_client.lrange(f"tasks:{t_id}:contributors", 0, -1)
     
     seen = set()
     compute_nodes = []
-    operator_vaults = []
     
     for b in contributors_bytes:
         try:
-            c = json.loads(b.decode("utf-8"))
-            pair = (c["node"], c["vault"])
-            if pair not in seen:
-                seen.add(pair)
-                compute_nodes.append(c["node"])
-                operator_vaults.append(c["vault"])
+            node = b.decode("utf-8")
+            if node not in seen:
+                seen.add(node)
+                compute_nodes.append(node)
         except:
             pass
     
@@ -351,8 +339,7 @@ async def complete_task(req: CompleteTaskRequest):
     settlement_payload = {
         "task_id": t_id,
         "sub_agent": req.sub_agent,
-        "compute_nodes": compute_nodes,
-        "operator_vaults": operator_vaults
+        "compute_nodes": compute_nodes
     }
     await redis_client.rpush("tasks:settlement", json.dumps(settlement_payload))
     
