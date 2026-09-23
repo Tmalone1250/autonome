@@ -252,6 +252,10 @@ async def shutdown(ctx):
     await ctx['redis'].close()
     print("[Scheduler] ARQ Worker Shutdown.")
 
+import urllib.parse
+from arq.connections import RedisSettings
+url = urllib.parse.urlparse(REDIS_URL)
+
 class WorkerSettings:
     functions = []
     cron_jobs = [
@@ -261,12 +265,4 @@ class WorkerSettings:
     ]
     on_startup = startup
     on_shutdown = shutdown
-    redis_settings = None # Uses REDIS_URL env var implicitly via ARQ defaults if set, but we define custom redis client in ctx
-    
-    @classmethod
-    async def get_redis_settings(cls):
-        from arq.connections import RedisSettings
-        # Parse REDIS_URL "redis://127.0.0.1:6379/0"
-        import urllib.parse
-        url = urllib.parse.urlparse(REDIS_URL)
-        return RedisSettings(host=url.hostname or '127.0.0.1', port=url.port or 6379)
+    redis_settings = RedisSettings(host=url.hostname or '127.0.0.1', port=url.port or 6379)
