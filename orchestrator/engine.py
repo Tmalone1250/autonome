@@ -8,6 +8,7 @@ import time
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from typing import Optional
 import redis.asyncio as redis
 import requests
 
@@ -138,10 +139,10 @@ class TaskManifest(BaseModel):
 
 class CompleteTaskRequest(BaseModel):
     task_id: str
-    inference_result: str
-    proof_hash: str
-    signature: str
-    sub_agent: str
+    inference_result: Optional[str] = ""
+    proof_hash: Optional[str] = ""
+    signature: Optional[str] = ""
+    sub_agent: Optional[str] = ""
     node_address: str = Field(..., min_length=42, max_length=42, pattern=r'^0x[a-fA-F0-9]{40}$')
 
 class OrchestrateRequest(BaseModel):
