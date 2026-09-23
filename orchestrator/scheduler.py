@@ -24,7 +24,7 @@ async def watchdog_task(ctx):
     workers = await redis_client.hgetall("active_workers")
     dead_nodes = set()
     for node, last_hb in workers.items():
-        if now - float(last_hb) > 10:
+        if now - float(last_hb) > 30:
             print(f"[Scheduler] Worker {node} disconnected. Removing.")
             await redis_client.hdel("active_workers", node)
             # Remove any specific hardware telemetry stored for this worker if needed
