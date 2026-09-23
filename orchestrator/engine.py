@@ -324,12 +324,12 @@ async def complete_task(req: CompleteTaskRequest):
     
     for b in contributors_bytes:
         try:
-            node = b.decode("utf-8")
+            node = b.decode("utf-8") if isinstance(b, bytes) else str(b)
             if node not in seen:
                 seen.add(node)
                 compute_nodes.append(node)
-        except:
-            pass
+        except Exception as e:
+            print(f"Error parsing contributor: {e}")
     
     # Push to Master Relayer queue
     settlement_payload = {
