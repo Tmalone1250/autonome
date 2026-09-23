@@ -154,6 +154,7 @@ class HeartbeatRequest(BaseModel):
     node_id: str
     vault: str
     hardware: dict
+    max_acus: int = 0
 
 class CreateSessionRequest(BaseModel):
     agent: str
@@ -183,6 +184,7 @@ async def node_heartbeat(req: HeartbeatRequest):
     await redis_client.hset("active_workers", req.node_id, now)
     await redis_client.set(f"worker_vault:{req.node_id}", req.vault)
     await redis_client.set(f"worker_hw:{req.node_id}", json.dumps(req.hardware))
+    await redis_client.set(f"worker_acus:{req.node_id}", req.max_acus)
     
     # Try to pop a task
     task_json = await redis_client.lpop("tasks:pending")
@@ -426,13 +428,17 @@ async def admin_get_nodes():
     for node_id, last_beat in workers.items():
         vault = await redis_client.get(f"worker_vault:{node_id}") or ""
         hw_raw = await redis_client.get(f"worker_hw:{node_id}")
+        acu_raw = await redis_client.get(f"worker_acus:{node_id}")
         hw = json.loads(hw_raw) if hw_raw else {}
+        max_acus = int(acu_raw) if acu_raw else 0
+        
         nodes.append({
             "node_id": node_id,
             "vault": vault,
             "status": "ONLINE", # watchdog removes them if LOST
             "last_heartbeat": float(last_beat),
-            "hardware": hw
+            "hardware": hw,
+            "max_acus": max_acus
         })
     return {"nodes": nodes}
 

@@ -3,6 +3,7 @@ import time
 import sqlite3
 import docker
 import psutil
+import hashlib
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from eth_account.messages import encode_defunct
@@ -66,6 +67,22 @@ try:
 except Exception as e:
     print(f"Warning: Could not connect to Docker daemon: {e}")
     docker_client = None
+
+GLOBAL_ACU_SCORE = 0
+
+def run_acu_benchmark():
+    global GLOBAL_ACU_SCORE
+    print("[Worker] Running ACU Boot Benchmark (5s CPU lock)...")
+    start = time.time()
+    iterations = 0
+    data = b"autonome_acu_benchmark"
+    while time.time() - start < 5.0:
+        data = hashlib.sha256(data).digest()
+        iterations += 1
+    
+    # 10,000 hashes = 1 ACU
+    GLOBAL_ACU_SCORE = max(1, iterations // 10000)
+    print(f"[Worker] ACU Benchmark complete. Score: {GLOBAL_ACU_SCORE} ACU ({iterations} iterations)")
 
 app = FastAPI(title="DePIN Docker Worker Node")
 
@@ -239,7 +256,8 @@ async def http_polling_loop():
             payload = {
                 "node_id": node_address,
                 "vault": vault,
-                "hardware": hw
+                "hardware": hw,
+                "max_acus": GLOBAL_ACU_SCORE
             }
             
             resp = requests.post(f"{orchestrator_url}/nodes/heartbeat", json=payload, timeout=5)
@@ -300,6 +318,8 @@ async def http_polling_loop():
 
 @app.on_event("startup")
 async def startup_event():
+    # Run the CPU-locking benchmark in a thread pool to avoid freezing the event loop completely
+    await asyncio.get_event_loop().run_in_executor(None, run_acu_benchmark)
     asyncio.create_task(http_polling_loop())
 
 
