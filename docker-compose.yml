@@ -4,14 +4,17 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: autonome_orchestrator
-    command: ["uvicorn", "orchestrator.engine:app", "--host", "0.0.0.0", "--port", "8002"]
-    network_mode: "host"
+    command: ["uvicorn", "orchestrator.engine:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
     env_file:
       - .env
     environment:
-      - OLLAMA_HOST=${OLLAMA_HOST:-http://127.0.0.1:11434}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://host.docker.internal:11434}
       - WORKER_URL=http://127.0.0.1:8000
-      - REDIS_URL=redis://127.0.0.1:6379/0
+      - REDIS_URL=redis://redis:6379/0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - redis
     restart: unless-stopped
@@ -22,11 +25,10 @@ services:
       dockerfile: Dockerfile
     container_name: autonome_scheduler
     command: ["arq", "orchestrator.scheduler.WorkerSettings"]
-    network_mode: "host"
     env_file:
       - .env
     environment:
-      - REDIS_URL=redis://127.0.0.1:6379/0
+      - REDIS_URL=redis://redis:6379/0
       - PYTHONUNBUFFERED=1
     depends_on:
       - redis
@@ -35,7 +37,8 @@ services:
   redis:
     image: redis:alpine
     container_name: autonome_redis
-    network_mode: "host"
+    ports:
+      - "6379:6379"
     restart: unless-stopped
 
   autonome-worker:
@@ -44,9 +47,12 @@ services:
       dockerfile: Dockerfile
     container_name: autonome_worker
     command: ["uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "8000"]
-    network_mode: "host"
+    ports:
+      - "8000:8000"
     env_file:
       - .env
+    environment:
+      - ORCHESTRATOR_URL=http://autonome-orchestrator:8001
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.autonome:/root/.autonome
